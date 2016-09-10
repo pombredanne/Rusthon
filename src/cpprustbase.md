@@ -23,6 +23,7 @@ class CppRustBase( GoGenerator ):
 		self._root_classes = {}
 		self._java_classpaths = []
 		self._known_strings = set()
+		self._force_cstr = False
 		self.macros = {}
 
 
@@ -374,10 +375,10 @@ note: `nullptr` is c++11
 			return 'false'
 		elif node.id in self._rename_hacks:  ## TODO make the node above on the stack is not an attribute node.
 			return self._rename_hacks[ node.id ]
-		elif node.id=='self' and self._class_stack:
+		elif node.id=='self' and self._class_stack and self._cpp:
 			return 'this'
-
-		return node.id
+		else:
+			return node.id
 
 	def get_subclasses( self, C ):
 		'''
@@ -660,23 +661,15 @@ note: `nullptr` is c++11
 						rust_struct_init.append('%s:%s' %(key, default_type(bnode._struct_def[key])))
 
 				else:
-					assert self._go
-					raise SyntaxError('TODO mixed Go backend')
-					## Go only needs the name of the parent struct and all its items are inserted automatically ##
-					out.append('%s' %bnode.name)
-					## Go allows multiple variables redefined by the sub-struct,
-					## but this can throw an error: `invalid operation: ambiguous selector`
-					## removing the duplicate name here fixes that error.
-					for key in bnode._struct_def.keys():
-						#if key in sdef:
-						#	sdef.pop(key)
-						if key in unionstruct:
-							unionstruct.pop(key)
+					raise RuntimeError('invalid backend')
 
 		node._struct_init_names = []  ## save order of struct layout
 
 		for name in unionstruct:
-			if unionstruct[name]=='interface{}': raise SyntaxError('interface{} is just for the Go backend')
+
+			if unionstruct[name]=='interface{}':
+				raise SyntaxError('interface{} is just for the Go backend')
+
 			node._struct_init_names.append( name )
 			#if name=='__class__': continue
 
@@ -947,14 +940,22 @@ handles all special calls
 		fname = force_name or self.visit(node.func)
 		if fname in self.macros:
 			macro = self.macros[fname]
+			if '%=' in macro:  ## advanced meta programming, captures the name of the variable the macro assigns to.
+				if not self._assign_var_name:
+					raise RuntimeError('the macro syntax `%=` can only be used as part of an assignment expression')
+				macro = macro.replace('%=', self._assign_var_name)
+
 			args = ','.join([self.visit(arg) for arg in node.args])
 			if '"%s"' in macro:
 				return macro % tuple([s.s for s in node.args])
 			elif '%s' in macro:
-				if macro.count('%s')==1:
+				if macro.count('%s')>1:
+					args = tuple([self.visit(s) for s in node.args])
+				try:
 					return macro % args
-				else:
-					return macro % tuple([self.visit(s) for s in node.args])
+				except TypeError as err:
+					raise RuntimeError('%s\nMACRO:\t%s\nARGS:\t%s' %(err[0], macro, args))
+
 			else:
 				return '%s(%s)' %(macro,args)
 
@@ -1192,6 +1193,17 @@ handles all special calls
 			infer_from = None
 			if len(node.args) and isinstance(node.args[0], ast.Name):
 				vname = node.args[0].id
+			elif len(node.args)==2 and isinstance(node.args[0], ast.Call):
+				## syntax: `let foo(bar) : SomeClass`, translates into c++11 universal constructor call
+				assert self._cpp
+				if isinstance(node.args[1], ast.Str):
+					T = node.args[1].s
+				else:
+					T = self.visit(node.args[1])
+
+				return '%s %s' %(T, self.visit(node.args[0]))
+
+
 			elif len(node.args) and isinstance(node.args[0], ast.Attribute): ## syntax `let self.x:T = y`
 				assert node.args[0].value.id == 'self'
 				assert len(node.args)==3
@@ -1245,11 +1257,15 @@ handles all special calls
 						return '%s %s = %s' %(V, vname, self.visit(infer_from))
 
 			elif len(node.args) == 1:
-				return '%s %s			/* declared */' %(V, node.args[0].id)
+				return '%s %s			/* declared - rust maybe able to infer the type */' %(V, node.args[0].id)
 			elif len(node.args) == 2:
 				if self._cpp:
-					T = node.args[1].s
-					if self.is_prim_type(T):
+					if isinstance(node.args[1], ast.Str):
+						T = node.args[1].s
+					else:
+						T = node.args[1].id
+
+					if self.is_prim_type(T) or T.endswith('*') or T.endswith('&'):
 						return '%s  %s' %(T, node.args[0].id)
 					else:
 						if not self._shared_pointers:
@@ -1259,16 +1275,41 @@ handles all special calls
 						else:
 							return 'std::shared_ptr<%s>  %s' %(T, node.args[0].id)
 				else:
-					if mutable:
-						return '%s mut %s : %s' %(V, node.args[0].id, node.args[1].s)
+					varname = node.args[0].id
+					typename = None
+					if isinstance(node.args[1], ast.Str):
+						typename = node.args[1].s
 					else:
-						return '%s %s : %s' %(V, node.args[0].id, node.args[1].s)
+						typename = node.args[1].id
+
+					if mutable:
+						return '%s mut %s : %s' %(V, varname, typename)
+					else:
+						return '%s %s : %s' %(V, varname, typename)
 
 			elif len(node.args) == 3:
 				if self._cpp:
-					T = node.args[1].s
-					if self.is_prim_type(T):
-						return '%s  %s = %s' %(T, node.args[0].id, self.visit(node.args[2]))
+					if isinstance(node.args[1], ast.Name):
+						T = node.args[1].id
+					else:
+						T = node.args[1].s
+					T = T.strip()
+					if self.is_prim_type(T) or T.endswith('&') or isinstance(node.args[2], ast.Set):
+						if T.endswith('&'):
+							## http://stackoverflow.com/questions/1565600/how-come-a-non-const-reference-cannot-bind-to-a-temporary-object
+							## TODO is using `const T&` safer?
+							#T = 'const '+T  ## this also works
+							## strip away `&`
+							T = T[:-1]
+						varname = node.args[0].id
+						if '*' in T:
+							varname += '[]' * T.count('*')
+							if T=='const char*':
+								self._force_cstr = True
+						data = self.visit(node.args[2])
+						self._force_cstr = False
+
+						return '%s  %s = %s' %(T, varname, data)
 					else:
 						if not self._shared_pointers:
 							return '%s*  %s = %s' %(T, node.args[0].id, self.visit(node.args[2]))
@@ -1276,7 +1317,7 @@ handles all special calls
 							return 'std::unique_ptr<%s>  %s = %s' %(T, node.args[0].id, self.visit(node.args[2]))
 						else:
 							return 'std::shared_ptr<%s>  %s = %s' %(T, node.args[0].id, self.visit(node.args[2]))
-				else:
+				else:  ## rust
 					if mutable:
 						return '%s mut %s : %s = %s' %(V, node.args[0].id, node.args[1].s, self.visit(node.args[2]))
 					else:
@@ -1329,15 +1370,19 @@ handles all special calls
 
 		elif fname == '__open__':
 			if self._cpp:
-				return '__open__(%s, %s)' %(self.visit(node.args[0]), self.visit(node.args[1]))
+				if len(node.args) == 2:
+					return '__open__(%s, %s)' % (self.visit(node.args[0]), self.visit(node.args[1]))
+				else:
+					return '__open__(%s, std::string("rb"))' % self.visit(node.args[0])
+
 			else:
 				return 'File::open_mode( &Path::new(%s.to_string()), Open, Read )' %self.visit(node.args[0])
 
-		elif fname == '__arg_array__':  ## TODO make this compatible with Go backend, move to pythonjs.py
+		elif fname == '__arg_array__':
 			assert len(node.args)==1
 			T = self.parse_go_style_arg(node.args[0])
 			if self._rust:
-				if T == 'int': ## TODO other ll types
+				if self.is_prim_type(T):
 					#return '&mut Vec<%s>' %T
 					return 'Rc<RefCell< Vec<%s> >>' %T
 				else:
@@ -1396,17 +1441,9 @@ handles all special calls
 		if node.keywords:
 			haskwargs = True
 			if args: args += ','
-			if self._go:
-				## This style works with Go because missing members are always initalized
-				## to their null value.  It also works in Rust and C++, but only when all
-				## keywords are always given - which is almost never the case.
-				args += '_kwargs_type_{'
-				x = ['%s:%s' %(kw.arg,self.visit(kw.value)) for kw in node.keywords]
-				x.extend( ['__use__%s:true' %kw.arg for kw in node.keywords] )
-				args += ','.join( x )
-				args += '}'
-			elif self._rust:
-				raise RuntimeError('TODO fix named params for rust backend')
+
+			if self._rust:
+				raise RuntimeError( self.format_error('TODO calling a function named params for rust backend') )
 			elif self._cpp:
 				## In the future we can easily optimize this away on plain functions,
 				## because it is simple to lookup the function here, and see the order
@@ -1420,7 +1457,10 @@ handles all special calls
 
 		if node.starargs:
 			if args: args += ','
-			args += '*%s...' %self.visit(node.starargs)
+			if self._cpp:
+				args += '(*%s)' %self.visit(node.starargs)
+			else:
+				args += '*%s...' %self.visit(node.starargs)
 
 
 		if hasattr(node, 'is_new_class_instance') and self._rust:
@@ -1470,13 +1510,23 @@ regular Python has no support for.
 			if self._cpp:
 				if isinstance(node.right, ast.Call) and isinstance(node.right.func, ast.Name):
 					classname = node.right.func.id
-					if node.right.args:
-						args = ','.join([self.visit(arg) for arg in node.right.args])
-						return '(new %s)->__init__(%s)' %(classname, args)
+					if classname in self._classes:
+						if node.right.args:
+							args = ','.join([self.visit(arg) for arg in node.right.args])
+							return '(new %s)->__init__(%s)' %(classname, args)
+						else:
+							return '(new %s)->__init__()' %classname
 					else:
-						return '(new %s)' %classname
+						if node.right.args:
+							args = ','.join([self.visit(arg) for arg in node.right.args])
+							return '(new %s(%s))' %(classname, args)
+						else:
+							return '(new %s)' %classname
+
 				else:
-					raise SyntaxError(self.format_error(self.visit(node.right)))
+					#raise SyntaxError(self.format_error(self.visit(node.right)))
+					return '(new %s)' %self.visit(node.right)
+
 			else:
 				return ' new %s' %right
 
@@ -1508,9 +1558,7 @@ regular Python has no support for.
 					## cpp-channel API
 					return '%s.recv()' %right
 				elif self._rust:
-					return '%s.recv()' %right
-				else:  ## Go
-					return '<- %s' %right
+					return '%s.recv().unwrap()' %right
 
 			elif isinstance(node.left, ast.Call) and isinstance(node.left.func, ast.Name) and node.left.func.id in go_hacks:
 				if node.left.func.id == '__go__func__':
@@ -1518,8 +1566,9 @@ regular Python has no support for.
 				elif node.left.func.id == '__go__map__':
 					key_type = self.visit(node.left.args[0])
 					value_type = self.visit(node.left.args[1])
-					if value_type == 'interface': value_type = 'interface{}'
-					return '&map[%s]%s%s' %(key_type, value_type, right)
+					## TODO check where this is used,
+					## this should actually return the map wrapped in std::shared_ptr
+					return 'std::map<%s, %s>%s' %(key_type, value_type, right)
 				else:
 					if isinstance(node.right, ast.Name):
 						raise SyntaxError(node.right.id)
@@ -1527,7 +1576,7 @@ regular Python has no support for.
 					right = []
 					for elt in node.right.elts:
 						if isinstance(elt, ast.Num) and self._rust:
-							right.append( str(elt.n)+'i' )
+							right.append( str(elt.n)+'i64' )
 						else:
 							right.append( self.visit(elt) )
 
@@ -1545,10 +1594,8 @@ regular Python has no support for.
 							#return '&mut vec!%s' %right
 							return 'Rc::new(RefCell::new(vec!%s))' %right
 
-						elif self._go:
-							## DEPRECATED
-							self._catch_assignment = {'class':T}  ## visit_Assign catches this
-							return '&[]*%s%s' %(T, right)
+						else:
+							raise RuntimeError('invalid backend')
 
 					elif node.left.func.id == '__go__arrayfixed__':
 						asize = self.visit(node.left.args[0])
@@ -1559,17 +1606,12 @@ regular Python has no support for.
 						elif self._rust:
 							#return '&vec!%s' %right
 							return 'Rc::new(RefCell::new(vec!%s))' %right
-						elif self._go:
-							raise SyntaxError('TODO merge go/rust/c++ backends')
-							if not isprim:
-								if right != '{}': raise SyntaxError(right)
-								return '&make([]*%s, %s)' %(atype, asize)
+						else:
+							raise RuntimeError('invalid backend')
 
 
 			elif isinstance(node.left, ast.Name) and node.left.id=='__go__array__':
-				if self._go:
-					return '*[]%s' %self.visit(node.right)
-				elif self._rust:
+				if self._rust:
 					raise RuntimeError('TODO array pointer')
 					return '&mut Vec<%s>' %self.visit(node.right)  ## TODO - test this
 				elif self._cpp:
@@ -1584,7 +1626,7 @@ regular Python has no support for.
 					else:
 						return 'std::shared_ptr<std::vector< std::shared_ptr<std::vector<%s>> >>'%mdtype
 				else:
-					raise RuntimeError('TODO array pointer')
+					raise RuntimeError('invalid backend')
 
 			elif isinstance(node.right, ast.Name) and node.right.id=='__as__':
 				if self._cpp:
@@ -1758,17 +1800,22 @@ TODO clean up go stuff.
 
 	def _visit_function(self, node):
 		out = []
+
 		is_declare = hasattr(node, 'declare_only') and node.declare_only  ## see pythonjs.py visit_With
 		is_closure = False
+
 		if self._function_stack[0] is node:
+
 			self._vars = set()
 			self._known_vars = set()
-			self._known_strings = set()
+			self._known_instances = dict()
+			self._known_arrays    = dict()
+			self._known_strings   = set()
 			self._known_pyobjects = dict()
-			##TODO self._known_arrays = ... etc, double check this
+			self._known_refs      = dict()
 
 		elif len(self._function_stack) > 1:
-			## do not clear self._vars and _known_vars inside of closure
+			## do not clear self._known_* inside of closures ##
 			is_closure = True
 
 		comments = []
@@ -1852,6 +1899,11 @@ TODO clean up go stuff.
 		for name in args_typedefs:
 			if args_typedefs[name]=='string':
 				self._known_strings.add(name)
+			elif args_typedefs[name].endswith('&'):
+				self._known_refs[name] = args_typedefs[name]
+			elif args_typedefs[name].endswith('*'):
+				self._known_instances[name]= args_typedefs[name]
+
 
 		returns_self = options['returns_self']
 		return_type = options['returns']
@@ -1884,6 +1936,9 @@ TODO clean up go stuff.
 					else:
 						return_type = 'std::shared_ptr<%s>' %return_type
 			else:
+				if return_type == 'self':  ## Rust 1.2 can not return keyword `self`
+					return_type = self._class_stack[-1].name
+
 				return_type = 'Rc<RefCell<%s>>' %return_type
 
 		if return_type == 'string':
@@ -1904,6 +1959,7 @@ TODO clean up go stuff.
 		varargs_name = None
 		is_method = False
 		args_gens_indices = []
+		closures = []
 
 		for i, arg in enumerate(node.args.args):
 			arg_name = arg.id
@@ -1924,35 +1980,41 @@ TODO clean up go stuff.
 
 			if arg_name in args_typedefs:
 				arg_type = args_typedefs[arg_name]
-				#if generics and (i==0 or (is_method and i==1)):
-				if self._go and generics and arg_name in args_generics.keys():  ## TODO - multiple generics in args
-					a = '__gen__ %s' %arg_type
-				else:
-					if self._cpp:
-						if arg_type in ('string', 'string&', 'string*'):
-							if self.usertypes and 'string' in self.usertypes:
-								if arg_type.endswith('&'):
-									arg_type = self.usertypes['string']['type'] + '&'
-								elif arg_type.endswith('*'):
-									arg_type = self.usertypes['string']['type'] + '*'
-								else:
-									arg_type = self.usertypes['string']['type']
+				if self._cpp:
+					if arg_type in ('string', 'string*', 'string&', 'string&&'):
+						if self.usertypes and 'string' in self.usertypes:
+							if arg_type.endswith('&&'):
+								arg_type = self.usertypes['string']['type'] + '&&'
+							elif arg_type.endswith('&'):
+								arg_type = self.usertypes['string']['type'] + '&'
+							elif arg_type.endswith('*'):
+								arg_type = self.usertypes['string']['type'] + '*'
 							else:
-								arg_type = 'std::string'  ## standard string type in c++
-
-						if arg_name in func_pointers:
-							## note C has funky function pointer syntax, where the arg name is in the middle
-							## of the type, the arg name gets put there when parsing above.
-							a = arg_type
+								arg_type = self.usertypes['string']['type']
 						else:
-							a = '%s %s' %(arg_type, arg_name)
+							#arg_type = 'std::string'  ## standard string type in c++
+							arg_type = arg_type.replace('string', 'std::string')
 
-						if generics and arg_name in args_generics.keys():
-							args_gens_indices.append(i)
-
+					if arg_name in func_pointers:
+						## note C has funky function pointer syntax, where the arg name is in the middle
+						## of the type, the arg name gets put there when parsing above.
+						a = arg_type
 					else:
-						if arg_type == 'string': arg_type = 'String'  ## standard string type in rust
-						a = '%s:%s' %(arg_name, arg_type)
+						a = '%s %s' %(arg_type, arg_name)
+
+					if generics and arg_name in args_generics.keys():
+						args_gens_indices.append(i)
+
+				elif self._rust:  ## standard string type in rust `String`
+					if arg_type == 'string': arg_type = 'String'  
+					if '|' in arg_type:
+						x,y,z = arg_type.split('|')
+						arg_type = '__functype__%s'%len(closures)
+						closures.append('%s:Fn(%s) %s' %('__functype__%s'%len(closures), y,z))
+
+					a = '%s:%s' %(arg_name, arg_type)
+
+
 			else:
 				arg_type = chan_args_typedefs[arg_name]
 				is_sender = False
@@ -1983,9 +2045,6 @@ TODO clean up go stuff.
 					else:
 						a = '%s : Sender<%s>' %(arg_name, arg_type)
 
-				elif self._go:  ## TODO move go logic here?  currently this is done in pythonjs_to_go.py
-					a = '%s chan %s' %(arg_name, arg_type)
-
 				else:
 					raise RuntimeError('TODO chan for backend')
 
@@ -2006,9 +2065,7 @@ TODO clean up go stuff.
 			if self._cpp:
 				args.append( '_KwArgs_*  __kwargs')
 			elif self._rust:
-				raise SyntaxError('TODO kwargs for rust')
-			elif self._go:
-				args.append( '__kwargs : _kwargs_type_')
+				raise SyntaxError( self.format_error('TODO named keyword parameters') )
 			else:
 				raise SyntaxError('TODO kwargs for some backend')
 
@@ -2044,21 +2101,23 @@ TODO clean up go stuff.
 		else:
 			method = ''
 
+		clonames = ','.join(['__functype__%s'%ci for ci in range(len(closures))])
+
+
 		if is_closure:
+			if self._rust and closures:
+				raise SyntaxError('TODO: rust syntax for a lambda function that takes function pointers as arguments')
+
 			if return_type:
 				if self._rust:
 					out.append( self.indent() + 'let %s = |%s| -> %s {\n' % (node.name, ', '.join(args), return_type) )
 				elif self._cpp:
 					out.append( self.indent() + 'auto %s = [&](%s) -> %s {\n' % (node.name, ', '.join(args), return_type) )
-				elif self._go:
-					out.append( self.indent() + '%s := func (%s) -> %s {\n' % (node.name, ', '.join(args), return_type) )
 			else:
 				if self._rust:
 					out.append( self.indent() + 'let %s = |%s| {\n' % (node.name, ', '.join(args)) )
 				elif self._cpp:
 					out.append( self.indent() + 'auto %s = [&](%s) {\n' % (node.name, ', '.join(args)) )
-				elif self._go:
-					out.append( self.indent() + '%s := func (%s) {\n' % (node.name, ', '.join(args)) )
 		else:
 			if return_type:
 				if self._cpp: ## c++ ##
@@ -2091,7 +2150,7 @@ TODO clean up go stuff.
 									osig = '%s%s %s(%s) { return this->%s(%s); }' % (prefix,return_type, fname, ','.join(args), fname, okwargs)
 									self._cpp_class_header.append(osig)
 
-					else:
+					else:  ## regular function
 						if self._noexcept:
 							sig = '%s%s %s(%s)' % (prefix,return_type, fname, ', '.join(args))
 							out.append( self.indent() + '%s noexcept {\n' % sig )
@@ -2104,10 +2163,31 @@ TODO clean up go stuff.
 				else:  ## rust ##
 					if is_method:
 						self._rust_trait.append('fn %s(&mut self, %s) -> %s;' %(node.name, ', '.join(args), return_type) )
-						out.append( self.indent() + 'fn %s(&mut self, %s) -> %s {\n' % (node.name, ', '.join(args), return_type) )
+						if closures:
+							out.append( self.indent() + 'fn %s<%s>(&mut self, %s) -> %s' % (node.name, clonames, ', '.join(args), return_type) )
+							out.append( self.indent() + '	where')
+							self.push()
+							for clo in closures:
+								out.append( self.indent() + '	%s,' %clo)
+							self.pull()
+							out.append( self.indent() + '{')
+
+						else:
+							out.append( self.indent() + 'fn %s(&mut self, %s) -> %s {' % (node.name, ', '.join(args), return_type) )
+
 					else:
-						out.append( self.indent() + 'fn %s(%s) -> %s {\n' % (node.name, ', '.join(args), return_type) )
-			else:
+						if closures:
+							out.append( self.indent() + 'fn %s<%s>(%s) -> %s' % (node.name, clonames, ', '.join(args), return_type) )
+							out.append( self.indent() + '	where')
+							self.push()
+							for clo in closures:
+								out.append( self.indent() + '	%s,' %clo)
+							self.pull()
+							out.append( self.indent() + '{')
+						else:
+							out.append( self.indent() + 'fn %s(%s) -> %s {' % (node.name, ', '.join(args), return_type) )
+
+			else:  ## function with no return type
 
 				if self._cpp: ## c++ ##
 					if is_method or options['classmethod']:
@@ -2150,9 +2230,29 @@ TODO clean up go stuff.
 				else:         ## rust ##
 					if is_method:
 						self._rust_trait.append('fn %s(&mut self, %s);' %(node.name, ', '.join(args)) )
-						out.append( self.indent() + 'fn %s(&mut self, %s) {\n' % (node.name, ', '.join(args)) )
+						if closures:
+							out.append( self.indent() + 'fn %s<%s>(&mut self, %s) ' % (node.name, clonames, ', '.join(args)) )
+							out.append( self.indent() + '	where')
+							self.push()
+							for clo in closures:
+								out.append( self.indent() + '	%s,' %clo)
+							self.pull()
+							out.append( self.indent() + '{')
+						else:
+							out.append( self.indent() + 'fn %s(&mut self, %s) {' % (node.name, ', '.join(args)) )
+
 					else:
-						out.append( self.indent() + 'fn %s(%s) {\n' % (node.name, ', '.join(args)) )
+						if closures:
+							out.append( self.indent() + 'fn %s<%s>(%s)' % (node.name, clonames, ', '.join(args)) )
+							out.append( self.indent() + '	where')
+							self.push()
+							for clo in closures:
+								out.append( self.indent() + '	%s,' %clo)
+							self.pull()
+							out.append( self.indent() + '{')
+						else:
+							out.append( self.indent() + 'fn %s(%s) {' % (node.name, ', '.join(args)) )
+
 		self.push()
 
 		if oargs:
@@ -2605,6 +2705,18 @@ Also swaps `.` for c++ namespace `::` by checking if the value is a Name and the
 					#return 'pointer(%s)->%s' % (name, attr)
 
 			else:  ## rust
+				## note: this conflicts with the new Rust unstable API,
+				## where the `append` method acts like Pythons `extend` (but moves the contents)
+				## depending on how the Rust API develops, this may have to be deprecated,
+				## or a user option to control if known arrays that call `append` should be
+				## translated into `push`.
+				## note: as a workaround known arrays could have special method `merge`,
+				## that would be translated into `append`, while this would be more python,
+				## it breaks human readablity of the translation, and makes debugging harder,
+				## because the user has to be aware of this special case.
+				if attr=='append' and name in self._known_arrays:
+					attr = 'push'
+
 				return '%s.borrow_mut().%s' % (name, attr)
 
 		elif (name in self._known_strings) and not isinstance(parent_node, ast.Attribute):
@@ -2617,7 +2729,11 @@ Also swaps `.` for c++ namespace `::` by checking if the value is a Name and the
 			elif name.endswith(',') and name.startswith('PyObject_GetAttrString('):
 				return '%s"%s")' %(name, attr)
 			else:
-				if name in 'jvm nim cpython nuitka'.split():
+				if name in 'jvm nim cpython nuitka weak'.split():
+					return '%s->%s' % (name, attr)
+				elif name in self._known_refs:
+					return '%s.%s' % (name, attr)
+				elif name in self._known_instances:
 					return '%s->%s' % (name, attr)
 				elif self._shared_pointers:
 					return '__shared__(%s)->%s' % (name, attr)
@@ -2676,9 +2792,11 @@ List Comp
 		if self._rust:
 			if range_n:
 				if len(range_n)==1:
-					c = 'range(0u,%su)' %range_n[0]
+					#c = 'range(0u,%su)' %range_n[0]
+					c = '0u32..%su32' %range_n[0]
 				elif len(range_n)==2:
-					c = 'range(%su,%su)' %( range_n[0], range_n[1] )
+					#c = 'range(%su,%su)' %( range_n[0], range_n[1] )
+					c = '%su32..%su32' %( range_n[0], range_n[1] )
 				else:
 					raise SyntaxError('TODO list comp range(low,high,step)')
 
@@ -2840,6 +2958,7 @@ because they need some special handling in other places.
 				raise RuntimeError('TODO slice assignment')
 		else:
 			target = self.visit( node.targets[0] )
+			self._assign_var_name = target
 		#######################
 
 		if self._cpp and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute) and node.value.func.attr in ('pop', 'insert'):
@@ -2880,7 +2999,7 @@ because they need some special handling in other places.
 				## cpp-channel API
 				return '%s.send(%s);' % (target, value)
 			elif self._rust:
-				return '%s.send(%s);' % (target, value)
+				return '%s.send(%s).unwrap();' % (target, value)  ## Rust1.2 API, must call unwrap after send.
 			else: ## Go
 				return '%s <- %s;' % (target, value)
 
@@ -2891,7 +3010,7 @@ because they need some special handling in other places.
 
 			if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id in self._classes:
 				value = '__new__' + value
-				return 'let %s *%s = %s;' % (target, node.value.func.id, value)
+				return 'let %s *%s = %s;' % (target, node.value.func.id, value)  ## rust, TODO can c++ construct globals on the heap outside of function?
 			else:
 				guesstype = 'auto'
 				if isinstance(node.value, ast.Num):
@@ -3022,7 +3141,7 @@ because they need some special handling in other places.
 					if self._cpp:
 						pass
 					else:
-						value += 'i'
+						value += 'i64'
 
 			if value=='None':
 				if self._cpp:
@@ -3347,25 +3466,7 @@ because they need some special handling in other places.
 					self._known_instances[ target ] = classname
 
 					if self._cpp:
-						return 'auto %s = %s; // new style' %(target, value)
-
-						if False:  ## DEPRECATED
-							## make object on the stack, safe to use _ref_ in same block ##
-							## TODO move get-args-and-kwargs to its own helper function
-							constructor_args = value.strip()[ len(classname)+1 :-1] ## strip to just args
-							r = '%s  _ref_%s = %s{};' %(classname, target, classname)
-							if constructor_args:
-								r += '_ref_%s.__init__(%s);\n' %(target, constructor_args)
-							if self._shared_pointers:
-								if self._unique_ptr:
-									r += 'std::unique_ptr<%s> %s = _make_unique<%s>(_ref_%s);' %(classname, target, classname, target)
-								else:
-									r += 'std::shared_ptr<%s> %s = std::make_shared<%s>(_ref_%s);' %(classname, target, classname, target)
-							else:  ## raw pointer to object
-								#return 'auto %s = new %s;' %(target, value)  ## user must free memory manually
-								r += '%s* %s = &_ref_%s;' %(classname, target, target)  ## freeed when _ref_ goes out of scope
-							return r
-
+						return 'auto %s = %s; // new object' %(target, value)
 
 					else:  ## rust
 						self._construct_rust_structs_directly = False
@@ -3417,8 +3518,11 @@ because they need some special handling in other places.
 					if comptarget:
 						result.append('auto %s = %s;  /* list comprehension */' % (target, comptarget))
 						return '\n'.join(result)
+					elif isinstance(node.value, ast.BinOp) and isinstance(node.value.op, ast.RShift) and isinstance(node.value.left, ast.Name) and node.value.left.id=='__new__':
+						self._known_instances[target] = self.visit(node.value.right)
+						return 'auto %s = %s;  /* new object */' % (target, value)
 					else:
-						return 'auto %s = %s;  /* fallback */' % (target, value)
+						return 'auto %s = %s;  /* auto-fallback */' % (target, value)
 				else:
 					if value.startswith('Rc::new(RefCell::new('):
 						#return 'let _RC_%s = %s; let mut %s = _RC_%s.borrow_mut();	/* new array */' % (target, value, target, target)
@@ -3476,22 +3580,23 @@ because they need some special handling in other places.
 				if isclass:
 					classname = node.value.func.id
 					self._known_instances[ target ] = classname
-					## TODO move get-args-and-kwargs to its own helper function
-					constructor_args = value.strip()[ len(classname)+1 :-1] ## strip to just args
-					r = ''
-					if isglobal:
-						r += '/* global : %s, type:%s */\n' %(target, classname)
-					r += '%s  _ref_%s = %s{};' %(classname, target, classname)
-					if constructor_args:
-						r += '_ref_%s.__init__(%s);' %(target, constructor_args)
 
-					if not self._shared_pointers:
-						r += '\n%s = &_ref_%s;' %(target, target)
-					elif self._unique_ptr:
-						r += '\n%s = std::make_unique<%s>(_ref_%s);' %(target, classname, target)
-					else:
-						r += '\n%s = std::make_shared<%s>(_ref_%s);' %(target, classname, target)
-					return r
+					return '%s = %s;' %(target, value)
+					## TODO remove below
+					#constructor_args = value.strip()[ len(classname)+1 :-1] ## strip to just args
+					#r = ''
+					#if isglobal:
+					#	r += '/* global : %s, type:%s */\n' %(target, classname)
+					#r += '%s  _ref_%s = %s{};' %(classname, target, classname)
+					#if constructor_args:
+					#	r += '_ref_%s.__init__(%s);' %(target, constructor_args)
+					#if not self._shared_pointers:
+					#	r += '\n%s = &_ref_%s;' %(target, target)
+					#elif self._unique_ptr:
+					#	r += '\n%s = std::make_unique<%s>(_ref_%s);' %(target, classname, target)
+					#else:
+					#	r += '\n%s = std::make_shared<%s>(_ref_%s);' %(target, classname, target)
+					#return r
 
 				elif is_attr and target.startswith('PyObject_GetAttrString(') and target.endswith(')'):
 					pyob = self.visit(node.targets[0].value.value)

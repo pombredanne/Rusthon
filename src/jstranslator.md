@@ -28,16 +28,25 @@ from ast import Tuple
 from ast import Attribute
 from ast import NodeVisitor
 
+BLOCKIDS = False
+
 class SwapLambda( RuntimeError ):
 	def __init__(self, node):
 		self.node = node
 		RuntimeError.__init__(self)
 
 class JSGenerator(NodeVisitorBase, GeneratorBase):
-	def __init__(self, source, requirejs=True, insert_runtime=True, webworker=False, function_expressions=True, fast_javascript=False, fast_loops=False, runtime_checks=True):
-		assert source
+	def __init__(self, source, requirejs=True, insert_runtime=True, webworker=False, function_expressions=True, fast_javascript=False, fast_loops=False, runtime_checks=True, as_module=False):
+		if not source:
+			raise RuntimeError('empty source string')
 		NodeVisitorBase.__init__(self, source)
 
+		self._v8 = '--v8-natives' in sys.argv
+		self._ES6 = {
+			'imports' : True
+		}
+		self._as_module = as_module
+		self._in_locals = False
 		self._unicode_name_map = UNICODE_NAME_MAP
 
 		self._iter_id = 0  ## used by for loops
@@ -115,10 +124,11 @@ class is not implemented here for javascript, it gets translated ahead of time i
 
 
 	def visit_Expr(self, node):
-		## note: the javascript backend overloads this ##
+
 		s = self.visit(node.value)
 		if s is None:
 			raise RuntimeError('GeneratorBase ExpressionError: %s' %node.value)
+
 		if s.strip() and not s.endswith(';'):
 			s += ';'
 
@@ -130,7 +140,9 @@ class is not implemented here for javascript, it gets translated ahead of time i
 			elif not len(self._function_stack) or s.startswith('var '):
 				return s
 			elif isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id=='inline':
+				if typedpython.needs_escape(s):raise RuntimeError(s)
 				return s
+
 			elif isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id=='sleep':
 				assert self._stack[-1] is node
 				if len(self._stack) < 3:
@@ -146,22 +158,39 @@ class is not implemented here for javascript, it gets translated ahead of time i
 				return s
 			else:
 				## note `debugger` is a special statement in javascript that sets a break point if the js console debugger is open ##
+				do_try = True
 				caller = self._function_stack[-1].name
 				called = None
 				if isinstance(node.value, ast.Call):
 					called = self.visit(node.value.func)
+					if isinstance(node.value.func, ast.Name) and node.value.func.id=='new':
+						do_try = False
+				elif isinstance(node.value, ast.Attribute):
+					do_try = False
 
-				a = '/***/ try {\n'
-				a += self.indent() + s + '\n'
-				if called:
-					a += self.indent() + '/***/ } catch (__err) { if (𝗗𝗲𝗯𝘂𝗴𝗴𝗲𝗿.onerror(__err, %s, %s)==true){debugger;}else{throw __err;} };' %(caller, called)
+				if not do_try:
+					return s
 				else:
-					a += self.indent() + '/***/ } catch (__err) { if (𝗗𝗲𝗯𝘂𝗴𝗴𝗲𝗿.onerror(__err, %s)==true){debugger;}else{throw __err;} };' %caller
-				return a
+					a = '/***/ try {\n'
+					a += self.indent() + s + '\n'
+					if typedpython.unicode_vars:
+						if called:
+							a += self.indent() + '/***/ } catch (__err) { if (𝗗𝗲𝗯𝘂𝗴𝗴𝗲𝗿.onerror(__err, %s, %s)==true){debugger;}else{throw __err;} };' %(caller, called)
+						else:
+							a += self.indent() + '/***/ } catch (__err) { if (𝗗𝗲𝗯𝘂𝗴𝗴𝗲𝗿.onerror(__err, %s)==true){debugger;}else{throw __err;} };' %caller
+					else:
+						if called:
+								a += self.indent() + '/***/ } catch (__err) { if (__debugger__.onerror(__err, %s, %s)==true){debugger;}else{throw __err;} };' %(caller, called)
+						else:
+							a += self.indent() + '/***/ } catch (__err) { if (__debugger__.onerror(__err, %s)==true){debugger;}else{throw __err;} };' %caller
+		
+					return a
 
 
 	def visit_Assign(self, node):
 		target = node.targets[0]
+		isname = isinstance(target, ast.Name)
+
 		if isinstance(target, Tuple):
 			raise NotImplementedError('target tuple assignment should have been transformed to flat assignment by python_to_pythonjs.py')
 		else:
@@ -179,25 +208,47 @@ class is not implemented here for javascript, it gets translated ahead of time i
 			else:
 				target = self.visit(target)
 
-			if value.startswith('𝑾𝒐𝒓𝒌𝒆𝒓𝑷𝒐𝒐𝒍.send('):
-				if target=='this':  ## should assert that this is on the webworker side
-					target = 'this.__uid__'
-					value = value.replace('𝑾𝒐𝒓𝒌𝒆𝒓𝑷𝒐𝒐𝒍.send(', 'self.postMessage(')
-				code = value % target
-			elif value.startswith('𝑾𝒐𝒓𝒌𝒆𝒓𝑷𝒐𝒐𝒍.recv') or value.startswith('𝑾𝒐𝒓𝒌𝒆𝒓𝑷𝒐𝒐𝒍.get') or value.startswith('𝑾𝒐𝒓𝒌𝒆𝒓𝑷𝒐𝒐𝒍.call'):
-				self._func_recv += 1
-				self.push()
-				code = value % target
-			else:
-				code = '%s = %s;' % (target, value)
-
 
 			if self._requirejs and target not in self._exports and self._indent == 0 and '.' not in target:
 				self._exports.add( target )
 
+
+
+			########################################
+			if value.startswith('ⲢⲑⲑⲒ.send('):
+				if target=='this':  ## should assert that this is on the webworker side
+					target = 'this.__uid__'
+					value = value.replace('ⲢⲑⲑⲒ.send(', 'self.postMessage(')
+				code = value % target
+			elif value.startswith('ⲢⲑⲑⲒ.recv') or value.startswith('ⲢⲑⲑⲒ.get') or value.startswith('ⲢⲑⲑⲒ.call'):
+				self._func_recv += 1
+				self.push()
+				code = value % target
+			else:
+				if isname and len(self._function_stack):
+					if self._runtime_type_checking or hasattr(self._function_stack[-1],'has_locals') or self._in_locals: 
+						#target = '%s.locals.%s=%s' %(self._function_stack[-1].name, target, target)
+						#target = 'arguments.callee.locals.%s=%s' %(target, target)  ## breaks with multiple sleeps
+						target = 'ƒ.locals.%s=%s' %(target, target)
+
+
+				code = '%s = %s;' % (target, value)
+
+			if self._v8 and isname and len(self._function_stack) and self._runtime_type_checking:
+				code += 'if ('+target+' && typeof('+target+')=="object" && ! %HasFastProperties(' + target + ')) console.log("V8::WARN-SLOW-PROPS->%s");'%target
+
 			return code
 
 	def visit_AugAssign(self, node):
+		methodnames = {
+			'+': 'add',
+			'-': 'sub',
+			'*': 'mul',
+			'/': 'div',
+			'%': 'mod'
+		}
+
+
 		## n++ and n-- are slightly faster than n+=1 and n-=1
 		target = self.visit(node.target)
 		op = self.visit(node.op)
@@ -208,13 +259,45 @@ class is not implemented here for javascript, it gets translated ahead of time i
 			a = '%s --;' %target
 		elif op=='+' and isinstance(node.value, ast.Num):
 			a = '%s %s= %s;' %(target, op, value)  ## direct
-		elif op == '+':
-			## supports += syntax for arrays ##
+		elif op == '+' and not self._go:
+			if self._with_oo:
+				## supports += syntax for arrays ##
+				if typedpython.unicode_vars:
+					x = [
+						'if (%s instanceof Array || 𝑰𝒔𝑻𝒚𝒑𝒆𝒅𝑨𝒓𝒓𝒂𝒚(%s)) { %s.extend(%s); }' %(target,target,target, value),
+						self.indent() + 'else if (%s.__iadd__) { %s.__iadd__(%s); }' %(target,target, value),
+						self.indent() + 'else { %s %s= %s; }'%(target, op, value)
+					]
+				else:
+					x = [
+						'if (%s instanceof Array || __is_typed_array(%s)) { %s.extend(%s); }' %(target,target,target, value),
+						self.indent() + 'else if (%s.__iadd__) { %s.__iadd__(%s); }' %(target,target, value),
+						self.indent() + 'else { %s %s= %s; }'%(target, op, value)
+					]
+				a = '\n'.join(x)
+			elif self._runtime_type_checking:
+				if typedpython.unicode_vars:
+					x = [
+						'if (%s instanceof Array || 𝑰𝒔𝑻𝒚𝒑𝒆𝒅𝑨𝒓𝒓𝒂𝒚(%s)) { throw new RuntimeError("Array += Array is not allowed without operator overloading"); }' %(target,target),
+						self.indent() + '%s %s= %s;'%(target, op, value)
+					]
+				else:
+					x = [
+						'if (%s instanceof Array || __is_typed_array(%s)) { throw new RuntimeError("Array += Array is not allowed without operator overloading"); }' %(target,target),
+						self.indent() + 'else { %s %s= %s; }'%(target, op, value)
+					]
+				a = '\n'.join(x)
+			else:
+				a = '%s %s= %s;' %(target, op, value)  ## direct
+
+		elif op in methodnames.keys() and self._with_oo and not self._go:
+			m = methodnames[op]
 			x = [
-				'if (%s instanceof Array || 𝑰𝒔𝑻𝒚𝒑𝒆𝒅𝑨𝒓𝒓𝒂𝒚(%s)) { %s.extend(%s); }' %(target,target,target, value),
-				'else { %s %s= %s; }'%(target, op, value)
+				'if (%s.__i%s__) { %s.__i%s__(%s) }' %(target,m, target,m, value),
+				self.indent() + 'else { %s %s= %s; }'%(target, op, value)
 			]
 			a = '\n'.join(x)
+
 		else:
 			a = '%s %s= %s;' %(target, op, value)  ## direct
 
@@ -236,6 +319,9 @@ generate a generic or requirejs module.
 				'define( function(){',
 				'__module__ = {}'
 			])
+		elif self._ES6['imports'] and self._as_module:
+			header.append('module "%s" {' %name)
+
 
 		return {
 			'name'   : name,
@@ -258,6 +344,107 @@ top level the module, this builds the output and returns the javascript string t
 					self._unicode_name_map[ node.name ] = decor.args[0].s
 
 
+	def _importfrom_helper(self, node):
+		if node.module=='nodejs':
+			self._insert_nodejs_runtime = True
+		elif node.module=='nodejs.tornado':
+			self._insert_nodejs_tornado = True
+		else:
+			inames = [ n.name for n in node.names ]
+			return 'import {%s} from "%s";' %(','.join(inames), node.module)
+
+		return ''
+
+	def visit_Import(self, node):
+		rapydlibs = {
+			'math': '/lib/node_modules/rapydscript/src/lib/math.pyj',
+			'random': '/lib/node_modules/rapydscript/src/lib/random.pyj',
+			're': '/lib/node_modules/rapydscript/src/lib/re.pyj',
+			'operator': '/lib/node_modules/rapydscript/src/lib/operator.pyj',
+		}
+		res = []
+		for alias in node.names:
+			alias.name = alias.name.replace('__SLASH__', '/').replace('__DASH__', '-')
+			if alias.name in rapydlibs.keys():
+				pyj = rapydlibs[ alias.name ]
+				if not os.path.isfile(pyj):
+					raise RuntimeError('can not find rapydscript stdlib source: %s' %pyj)
+
+				tmpjs = tempfile.gettempdir() + '/rapyd-output.js'
+				subprocess.check_call(['rapydscript', pyj, '--bare', '--prettify', '--output', tmpjs])
+				rapydata = open(tmpjs,'rb').read()
+				#raise RuntimeError(rapydata)
+				#res.append(rapydata)
+				in_mod = False
+				in_private = False
+				head  = []
+				body = []
+				tail = []
+				funcnames = set()
+				for line in rapydata.splitlines():
+					if line.strip()=='var __name__ = "__main__";':  ## hackish way to split head and module body
+						in_mod = True
+						body.append('var %s = {' %alias.name)
+					elif in_mod:
+						if line.startswith('_$'):
+							in_private = True
+						helpercall = False
+						for fname in funcnames:
+							if line.startswith(fname) and '(' in line and ')' in line and line.endswith(';'):
+								helpercall = True
+						#########################
+						if helpercall:
+							tail.append('%s.%s' %(alias.name, line))
+						elif in_private:
+							head.append(line)
+							if line=='};':
+								in_private = False
+						else:
+							if line.startswith('function '):
+								fname = line.split()[1].split('(')[0]
+								funcnames.add( fname )
+								line = '%s : %s' %(fname,line)
+							elif line == '}':  ## end of function
+								line += ','
+							elif line.strip() and line[0]!=' ' and line[-1]==';' and '=' in line:
+								#vname = line.split('=')[0].strip()
+								line = line.replace('=', ':').replace(';', ',')
+
+							## very hackish
+							if line.startswith(' '):
+								hacks = set()
+								for word in line.split():
+									if '(' not in word:
+										continue
+									word = word.split('(')[0]
+									for fname in funcnames:
+										if word == fname:
+											hacks.add(fname)
+								for fname in hacks:
+									line = line.replace(fname, '%s.%s'%(alias.name,fname))
+
+							body.append(line)
+					else:
+						head.append(line)
+				body.append('};')  ## end of module
+				res.extend(head)
+				res.extend(body)
+				res.extend(tail)
+
+			elif alias.asname:
+				res.append(
+					"var %s = require('%s');" %(alias.asname, alias.name)
+				)
+			else:
+				res.append(
+					"var %s = require('%s');" %(alias.name, alias.name)
+				)
+
+		if res:
+			return '\n'.join(res)
+		else:
+			return ''
+
 	def visit_Module(self, node):
 		modules = []
 
@@ -266,24 +453,25 @@ top level the module, this builds the output and returns the javascript string t
 		lines = mod['lines']
 		header = mod['header']
 
+		if self._v8:
+			#header.append('console.log("V8::Version");')
+			#header.append('console.log(%GetV8Version());')
+			#header.append('console.log("V8::Heap");')
+			#header.append('console.log(%GetHeapUsage());')
+			header.append('var v8 = function v8(fn) {return %OptimizeFunctionOnNextCall(fn);};')
+			header.append('v8.gc = function v8_gc() {return %CollectGarbage(null);};')
+
 		## first check for all the @unicode decorators,
 		## also check for special imports like `from runtime import *`
 		for b in node.body:
-			self._check_for_unicode_decorator(b)
+			if typedpython.unicode_vars:
+				self._check_for_unicode_decorator(b)
 
 			if isinstance(b, ast.ImportFrom):
 				line = self.visit(b)
 				if line:
-					raise RuntimeError('import-from specials do not return a string!')
-
-
-		if self._insert_runtime:
-			## always regenerate the runtime, in case the user wants to hack it ##
-			runtime = generate_js_runtime(
-				nodejs         = self._insert_nodejs_runtime,
-				nodejs_tornado = self._insert_nodejs_tornado
-			)
-			lines.insert( 0, runtime )
+					## ES6 imports
+					header.append(line)
 
 
 
@@ -298,19 +486,35 @@ top level the module, this builds the output and returns the javascript string t
 				line = self.visit(b)
 				if line: lines.append( line )
 
-		if self._has_channels and not self._webworker:
-			#lines.insert( 0, 'var __workerpool__ = new __WorkerPool__(__workersrc__, __workerimports__);')
-			# moved to intermediateform.md
-			pass
+
+		if self._insert_runtime:
+			## always regenerate the runtime, in case the user wants to hack it ##
+			runtime = generate_js_runtime(
+				nodejs         = self._insert_nodejs_runtime,
+				nodejs_tornado = self._insert_nodejs_tornado,
+				webworker_manager = self._has_channels and not self._webworker,
+				debugger = self._runtime_type_checking
+			)
+			lines.insert( 0, runtime )
+		else:
+			lines.insert( 0, 'var __$UID$__=0;')
 
 
+		#if self._has_channels and not self._webworker:
+		#	#lines.insert( 0, 'var __workerpool__ = new __WorkerPool__(__workersrc__, __workerimports__);')
+		#	# moved to intermediateform.md
+		#	pass
+
+		######################### modules ####################
 		if self._requirejs and not self._webworker:
 			for name in self._exports:
 				if name.startswith('__'): continue
 				lines.append( '__module__.%s = %s' %(name,name))
-
 			lines.append( 'return __module__')
 			lines.append('}) //end requirejs define')
+
+		elif self._ES6['imports'] and self._as_module:
+			lines.append('} // end ES6 module')
 
 
 		if len(modules) == 1:
@@ -371,7 +575,7 @@ TODO `finnally` for the javascript backend
 			return 'panic!("%s");'  % self.visit(node.type)
 		elif self._cpp:
 			T = self.visit(node.type)
-			if T == 'RuntimeError()': T = 'std::exception'
+			#if T == 'RuntimeError()': T = 'std::exception'
 			return 'throw %s;' % T
 		else:
 			## TODO - when re-raising an error, it fails because it is an Error object
@@ -424,6 +628,12 @@ note: `visit_Function` after doing some setup, calls `_visit_function` that subc
 	def _visit_function(self, node):
 		if node.name == '__DOLLAR__':
 			node.name = '$'
+
+		if typedpython.unicode_vars and typedpython.needs_escape(node.name):
+			node.name = typedpython.escape_text(node.name)
+		if node.name=='__right_arrow__' and len(self._function_stack)==1:
+			node.name = 'ᐅ'
+
 		comments = []
 		body = []
 		is_main = node.name == 'main'
@@ -432,11 +642,14 @@ note: `visit_Function` after doing some setup, calls `_visit_function` that subc
 		is_prototype = False
 		is_debugger  = False
 		is_redef     = False
+		is_locals    = False
 		is_staticmeth= False
 		is_getter    = False
 		is_setter    = False
 		is_unicode   = False
+		is_v8        = False
 		bind_to      = None
+		bind_to_this = None
 		protoname    = None
 		func_expr    = False  ## function expressions `var a = function()` are not hoisted
 		func_expr_var = True  ## this should always be true, was this false before for hacking nodejs namespace?
@@ -451,6 +664,8 @@ note: `visit_Function` after doing some setup, calls `_visit_function` that subc
 		args_generics = dict()
 		func_pointers = set()
 		arrays = dict()
+		has_timeout = None
+		timeout_seconds = None
 		########################
 		decorators = []
 		for decor in node.decorator_list:
@@ -474,11 +689,27 @@ note: `visit_Function` after doing some setup, calls `_visit_function` that subc
 				func_expr_var = isinstance(decor.args[0], ast.Name)
 				node.name = self.visit(decor.args[0])
 
+			elif isinstance(decor, ast.Call) and isinstance(decor.func, ast.Name) and decor.func.id == 'timeout':
+				has_timeout = True
+				timeout_seconds = decor.args[0].n
+				if decor.keywords:
+					raise RuntimeError(decor.keywords)
+				elif len(decor.args)>1 and isinstance(decor.args[1], ast.Dict):
+					if isinstance(decor.args[1].keys[0], ast.Name) and decor.args[1].keys[0].id=='loop':
+						dval = self.visit(decor.args[1].values[0])
+						if dval=='true' or dval == 'True' or dval == 1:
+							has_timeout = 'INTERVAL'
+					else:
+						raise SyntaxError(self.format_error('invalid option to @timeout decorator'))
 
 			elif isinstance(decor, ast.Call) and isinstance(decor.func, ast.Name) and decor.func.id == 'unicode':
-				assert len(decor.args)==1
-				is_unicode = True
-				node.name = decor.args[0].s
+				if typedpython.unicode_vars:
+					assert len(decor.args)==1
+					is_unicode = True
+					node.name = decor.args[0].s
+
+			elif isinstance(decor, ast.Name) and decor.id == 'v8':
+				is_v8 = True
 
 			elif isinstance(decor, ast.Name) and decor.id == 'getter':
 				is_getter = True
@@ -493,6 +724,13 @@ note: `visit_Function` after doing some setup, calls `_visit_function` that subc
 				is_debugger = True
 			elif isinstance(decor, ast.Name) and decor.id == 'redef':
 				is_redef = True
+				is_locals = True
+				node.has_locals = True
+				self._in_locals = True
+			elif isinstance(decor, ast.Name) and decor.id == 'locals':
+				is_locals = True
+				node.has_locals = True
+				self._in_locals = True
 
 			elif isinstance(decor, ast.Name) and decor.id == '__pyfunction__':
 				is_pyfunc = True
@@ -504,17 +742,30 @@ note: `visit_Function` after doing some setup, calls `_visit_function` that subc
 				assert len(decor.args)==1
 				is_prototype = True
 				protoname = decor.args[0].id
+				if typedpython.needs_escape(protoname):
+					protoname = typedpython.escape_text(protoname)
+
 			elif isinstance(decor, ast.Call) and isinstance(decor.func, ast.Name) and decor.func.id == 'returns':
 				returns = decor.args[0].id
-			elif isinstance(decor, ast.Call) and isinstance(decor.func, ast.Name) and decor.func.id == 'bind':
-				assert len(decor.args)==1
-				bind_to = self.visit(decor.args[0])
 
+			elif isinstance(decor, ast.Call) and isinstance(decor.func, ast.Name) and decor.func.id == 'bind':
+				assert len(decor.args)<=2
+				bind_to = self.visit(decor.args[0])
+				if len(decor.args)==2:
+					bind_to_this = self.visit(decor.args[1])
 			else:
 				decorators.append( self.visit(decor)+'(' )
 
 		dechead = ''.join(decorators)
 		dectail = ')' * len(decorators)
+		if has_timeout:
+			if has_timeout=='INTERVAL':
+				dechead = '__set_interval('+dechead
+				dectail += ', %s)' %(timeout_seconds)
+			else:
+				dechead = '__set_timeout('+dechead
+				dectail += ', %s)' %(timeout_seconds)
+
 		args = self.visit(node.args)
 		funcname = node.name
 
@@ -553,12 +804,15 @@ note: `visit_Function` after doing some setup, calls `_visit_function` that subc
 						'	/***/ var __entryargs__ = arguments;',
 						'	/***/ try {var __win = require("nw.gui").Window.get(); __win.showDevTools(); __win.focus(); __win.moveTo(10,0);} catch (__err) {};',
 						'	setTimeout(function(){%s_wrapped(__entryargs__)}, 2000);' %node.name,
-						'	function %s_wrapped(%s)' % (node.name, ', '.join(args)),  ## scope lifted ok here
+						'	var %s_wrapped = function %s_wrapped(%s)' % (node.name, node.name, ', '.join(args)),  ## scope lifted ok here
 					]
 					fdef = '\n'.join(d)
 					self.push()
 				elif bind_to:
-					fdef = '%s = %s function %s(%s)' % (bind_to,dechead, node.name,  ', '.join(args))
+					if bind_to_this:
+						fdef = '%s = %s (function %s(%s)' % (bind_to,dechead, node.name,  ', '.join(args))
+					else:
+						fdef = '%s = %s function %s(%s)' % (bind_to,dechead, node.name,  ', '.join(args))
 				else:
 					fdef = 'var %s = %s function %s(%s)' % (node.name,dechead, node.name,  ', '.join(args))
 
@@ -575,28 +829,46 @@ note: `visit_Function` after doing some setup, calls `_visit_function` that subc
 
 			if self._func_expressions or func_expr:
 				if bind_to:
-					fdef = '%s = %s function %s(%s)' % (bind_to,dechead, node.name,  ', '.join(args))
+					if bind_to_this:
+						fdef = '%s = %s (function %s(%s)' % (bind_to,dechead, node.name,  ', '.join(args))
+					else:
+						fdef = '%s = %s function %s(%s)' % (bind_to,dechead, node.name,  ', '.join(args))
 				else:
 					fdef = 'var %s = %s function %s(%s)' % (node.name,dechead, node.name,  ', '.join(args))
 
 			else: ## scope lifted functions are not safe ##
 				fdef = 'function %s(%s)' % (node.name, ', '.join(args))
 
-		body.append( fdef )
+		if BLOCKIDS:
+			if is_prototype or (bind_to and '.prototype.' in bind_to):
+				body.append( '/*BEGIN-METH:%s*/' %id(node))
+			else:
+				body.append( '/*BEGIN-FUNC:%s*/' %id(node))
 
-		body.append( self.indent() + '{' )
+		body.append( self.indent() + fdef + '{' )
+		#body.append( self.indent() + '{' )
+
 		self.push()
 
 		if self._runtime_type_checking or is_redef:
 			## doing the recompile and eval inside the function itself allows it to pick
 			## up any variables from the outer scope if it is a nested function.
 			## note: the user calls `myfunc.redefine(src)` and then on next call it is recompiled.
+			body.append('/***/var ƒ = arguments.callee;')
 			body.append(
 				'/***/ if (%s.__recompile !== undefined) { eval("%s.__redef="+%s.__recompile); %s.__recompile=undefined; };' %(funcname, funcname, funcname, funcname)
 			)
 			body.append(
 				'/***/ if (%s.__redef !== undefined) { return %s.__redef.apply(this,arguments); };' %(funcname, funcname)
 			)
+
+		if self._v8 and is_v8:
+			body.append(
+				'/***/ if (!%s.optimized) { '%funcname + '%OptimizeFunctionOnNextCall(' + '%s);%s.optimized=true;};'%(funcname,funcname)
+			)
+
+		if node.args.vararg:
+			body.append('var %s = Array.prototype.splice.call(arguments,%s, arguments.length);' %(node.args.vararg, len(node.args.args)) )
 
 		next = None  ## deprecated?
 		
@@ -614,12 +886,13 @@ note: `visit_Function` after doing some setup, calls `_visit_function` that subc
 				msg = 'error in function: %s'%node.name
 				msg += '\n%s' %child
 				raise SyntaxError(msg)
-			else:
+			elif v.strip():
 				body.append( self.indent()+v)
 
 		## todo fix when sleep comes before channel async _func_recv, should be a stack of ['}', '});']
 		if self._sleeps:
 			body.append( '}/*end-sleep*/' * self._sleeps)
+			#body.append( '__sleep__%s.locals={};' % self._sleeps)  ## breaks on multiple sleeps
 			self._sleeps = 0
 
 		if self._func_recv:
@@ -630,10 +903,21 @@ note: `visit_Function` after doing some setup, calls `_visit_function` that subc
 
 		## end of function ##
 		self.pull()
-		body.append( self.indent() + '}/*end-function*/' )
+		body.append( self.indent() + '}/*end->	`%s`	*/' %node.name)
+
+		if bind_to_this:
+			body.append( self.indent() + ').bind(%s);' %bind_to_this)
+
+		if BLOCKIDS:
+			if is_prototype or (bind_to and '.prototype.' in bind_to):
+				body.append( '/*END-METH:%s*/' %id(node))
+			else:
+				body.append( '/*END-FUNC:%s*/' %id(node))
+
 		if is_debugger:
+			body.append( self.indent()+ '%s_wrapped.locals={}; /*wrapped entry point*/' %node.name )
 			self.pull()
-			body.append( '}/*debugger*/' )
+			body.append( '} /*debugger*/' )
 
 		if dectail:
 			body.append(dectail + ';/*end-decorators*/')
@@ -648,6 +932,16 @@ note: `visit_Function` after doing some setup, calls `_visit_function` that subc
 			#stemplate = 'Object.defineProperty(%s.prototype, "%s", {get:%s, set:%s, enumerable:false, writable:false, configurable:true});'
 			stemplate = 'Object.defineProperty(%s.prototype, "%s", {get:%s, set:%s, configurable:true});'
 			body.append( stemplate%(protoname,node.name, getterfunc, funcname))
+
+		if self._runtime_type_checking or is_locals or self._in_locals:
+			if is_prototype:
+				body.append(
+					'%s.prototype.%s.locals = {};' % (protoname, node.name)
+				)
+			else:
+				body.append('%s.locals={};'%node.name)
+				if len(self._function_stack)>1:
+					body.append('arguments.callee.locals.%s=%s'%(node.name, node.name))
 
 		## below is used for runtime type checking ##
 		if returns:
@@ -675,7 +969,8 @@ note: `visit_Function` after doing some setup, calls `_visit_function` that subc
 			else:
 				body.append( node.name + '.args = [%s];' %targs )
 
-
+		if is_locals:
+			self._in_locals = False
 
 		buffer = '\n'.join( comments + body )
 		buffer += '\n'
@@ -719,6 +1014,9 @@ note: `visit_Function` after doing some setup, calls `_visit_function` that subc
 		return out
 
 	def visit_Name(self, node):
+		escape_hack_start = '__x0s0x__'
+		escape_hack_end = '__x0e0x__'
+
 		if node.id == 'None':
 			return 'null'
 		elif node.id == 'True':
@@ -730,21 +1028,46 @@ note: `visit_Function` after doing some setup, calls `_visit_function` that subc
 		elif node.id == '__DOLLAR__':
 			return '$'
 		elif node.id == 'debugger':  ## keyword in javascript
-			return '𝗗𝗲𝗯𝘂𝗴𝗴𝗲𝗿'
-		elif node.id in self._unicode_name_map:
+			if typedpython.unicode_vars:
+				return '𝗗𝗲𝗯𝘂𝗴𝗴𝗲𝗿'
+			else:
+				return '__debugger__'
+
+		elif node.id in self._unicode_name_map:  # from @unicode decorators
 			return self._unicode_name_map[node.id]
+
+		elif escape_hack_start in node.id:
+			#assert typedpython.unicode_vars
+			parts = []
+			for p in node.id.split(escape_hack_start):
+				if escape_hack_end in p:
+					id = int(p.split(escape_hack_end)[0].strip())
+					if id not in UnicodeEscapeMap.keys():
+						raise RuntimeError('id not in UnicodeEscapeMap')
+					uchar = UnicodeEscapeMap[ id ]
+					parts.append(uchar)
+				else:
+					parts.append(p)
+			res = ''.join(parts)
+			return res.encode('utf-8')
 		else:
 			return node.id
 
 	def visit_Attribute(self, node):
 		name = self.visit(node.value)
 		attr = node.attr
+
+		if typedpython.needs_escape(attr):
+			attr = typedpython.escape_text(attr)
+
 		return '%s.%s' % (name, attr)
 
 	def visit_Print(self, node):
 		args = [self.visit(e) for e in node.values]
-		#s = 'console.log(%s);' % ', '.join(args)
-		s = '𝑷𝒓𝒊𝒏𝒕(%s);' % ', '.join(args)
+		if typedpython.unicode_vars:
+			s = '𝑷𝒓𝒊𝒏𝒕(%s);' % ', '.join(args)
+		else:
+			s = 'console.log(%s);' % ', '.join(args)
 		return s
 
 	def visit_keyword(self, node):
@@ -785,13 +1108,25 @@ Call Helper
 		elif fname == 'sleep':
 			self._sleeps += 1
 			return 'setTimeout(__sleep__%s.bind(this), %s*1000); function __sleep__%s(){' % (self._sleeps, args[0], self._sleeps)
+		elif fname=='v8.__right_arrow__':
+			jitFN = args.split('(')[0]
+			return '%s; v8(%s)' %(args, jitFN)
+		elif fname.endswith('.__right_arrow__'):
+			ob = fname.replace('.__right_arrow__', '')
+			#return '__right_arrow__(%s, %s)' %(ob, args)
+			#return 'ᐅ(%s, %s)' %(ob, args)
+			if args:
+				return 'ᐅ(%s, %s)' %(ob, args)
+			else:
+				return 'ᐅ(%s)' %ob
+
 		else:
 			return '%s(%s)' % (fname, args)
 
 	def inline_helper_remap_names(self, remap):
 		return "var %s;" %','.join(remap.values())
 
-	def inline_helper_return_id(self, return_id):
+	def inline_helper_return_id(self, return_id):  ## what was this for?
 		return "var __returns__%s = null;"%return_id
 
 	def _visit_call_helper_numpy_array(self, node):
@@ -904,25 +1239,30 @@ Call Helper
 
 Inline Code Helper
 ------------------
-
-TODO clean this up
+called from user: `inline(str)`
+old javascript backend also used `JS(str)`
 
 ```python
 
 	def _inline_code_helper(self, s):
 		## TODO, should newline be changed here?
 		s = s.replace('\n', '\\n').replace('\0', '\\0')  ## AttributeError: 'BinOp' object has no attribute 's' - this is caused by bad quotes
-		if s.strip().startswith('#'): s = '/*%s*/'%s
 
-		if '"' in s or "'" in s:  ## can not trust direct-replace hacks
-			pass
-		else:
-			if ' or ' in s:
-				s = s.replace(' or ', ' || ')
-			if ' not ' in s:
-				s = s.replace(' not ', ' ! ')
-			if ' and ' in s:
-				s = s.replace(' and ', ' && ')
+		## DEPRECATED
+		#if s.strip().startswith('#'): s = '/*%s*/'%s
+		#if '"' in s or "'" in s:  ## can not trust direct-replace hacks
+		#	pass
+		#else:
+		#	if ' or ' in s:
+		#		s = s.replace(' or ', ' || ')
+		#	if ' not ' in s:
+		#		s = s.replace(' not ', ' ! ')
+		#	if ' and ' in s:
+		#		s = s.replace(' and ', ' && ')
+		
+		if typedpython.needs_escape(s):
+			s = typedpython.escape_text(s)
+
 		return s
 
 	def visit_While(self, node):
@@ -941,6 +1281,8 @@ TODO clean this up
 
 	def visit_Str(self, node):
 		s = node.s.replace("\\", "\\\\").replace('\n', '\\n').replace('\r', '\\r').replace('"', '\\"')
+		if typedpython.needs_escape(s):
+			s = typedpython.escape_text(s)
 		return '"%s"' % s
 
 	def visit_BinOp(self, node):
@@ -966,22 +1308,22 @@ TODO clean this up
 				self._has_channels = True
 				r = []
 				if isinstance(node.right, ast.Name):
-					r.append('𝑾𝒐𝒓𝒌𝒆𝒓𝑷𝒐𝒐𝒍.recv( %s,'%right)
+					r.append('ⲢⲑⲑⲒ.recv( %s,'%right)
 				elif isinstance(node.right, ast.Attribute):
 					wid = node.right.value.id
 					attr = node.right.attr
-					r.append('𝑾𝒐𝒓𝒌𝒆𝒓𝑷𝒐𝒐𝒍.get( %s, "%s", '%(wid, attr))
+					r.append('ⲢⲑⲑⲒ.get( %s, "%s", '%(wid, attr))
 				elif isinstance(node.right, ast.Call):
 					if isinstance(node.right.func, ast.Name):
 						fname = node.right.func.id
 						args  = [self.visit(a) for a in node.right.args]
-						r.append('𝑾𝒐𝒓𝒌𝒆𝒓𝑷𝒐𝒐𝒍.call( "%s", [%s], ' % (fname, ','.join(args)))
+						r.append('ⲢⲑⲑⲒ.call( "%s", [%s], ' % (fname, ','.join(args)))
 
 					else:
 						wid = node.right.func.value.id
 						attr = node.right.func.attr
 						args  = [self.visit(a) for a in node.right.args]
-						r.append('𝑾𝒐𝒓𝒌𝒆𝒓𝑷𝒐𝒐𝒍.callmeth( %s, "%s", [%s], '%(wid, attr, ','.join(args)))
+						r.append('ⲢⲑⲑⲒ.callmeth( %s, "%s", [%s], '%(wid, attr, ','.join(args)))
 				else:
 					raise RuntimeError(node.right)
 
@@ -991,7 +1333,7 @@ TODO clean this up
 			elif left == '__go__send__':
 				self._has_channels = True
 				r = [
-					'𝑾𝒐𝒓𝒌𝒆𝒓𝑷𝒐𝒐𝒍.send({message:%s,'%right,
+					'ⲢⲑⲑⲒ.send({message:%s,'%right,
 					'id:%s})'
 				]
 				return ''.join(r)
@@ -1003,38 +1345,65 @@ TODO clean this up
 				elif node.left.func.id == '__go__map__':  ## typed hash maps for javascript
 					key_type = node.left.args[0].id
 					value_type = node.left.args[1].id
-					## right will take the form: `𝑫𝒊𝒄𝒕({  }, { copy:false })`
-					## here was simply clip off the end and inject the type options
-					clipped = right[:-2]
-					if 'keytype:' not in clipped:
-						clipped += ',keytype:"%s"'  % key_type 
-					clipped += ',valuetype:"%s" })' % value_type
-					return clipped
+					if key_type == 'string':
+						## right will take the form: `𝑫𝒊𝒄𝒕({  }, { copy:false })`
+						## here was simply clip off the end and inject the type options
+						clipped = right[:-2]
+						if 'keytype:' not in clipped:
+							clipped += ',keytype:"%s"'  % key_type 
+						clipped += ',valuetype:"%s" })' % value_type
+						return clipped
+					else:
+						assert isinstance(node.right, ast.Call)
+						dictnode = node.right.args[0]
+						dlist = []
+						for i in range( len(dictnode.keys) ):
+							k = self.visit( dictnode.keys[ i ] )
+							v = self.visit( dictnode.values[i] )
+							dlist.append( '[%s, %s]' %(k,v) )
+						return 'dict([%s], {copy:false, keytype:"%s", valuetype:"%s"})' %(','.join(dlist), key_type, value_type)
+
+
 				else:
 					if isinstance(node.right, ast.Name):
 						raise SyntaxError(node.right.id)
 
 					right = []
 					for elt in node.right.elts:
-						if isinstance(elt, ast.Num):
-							right.append( str(elt.n)+'i' )
-						else:
-							right.append( self.visit(elt) )
-					right = '(%s)' %','.join(right)
+						right.append( self.visit(elt) )
 
 					if node.left.func.id == '__go__array__':
 						T = self.visit(node.left.args[0])
-						if T in go_types:
-							#return '&mut vec!%s' %right
-							return 'Rc::new(RefCell::new(vec!%s))' %right
-						else:
-							self._catch_assignment = {'class':T}  ## visit_Assign catches this
-							return '&[]*%s%s' %(T, right)
+						## TODO redefine `.append` on this instance to do runtime type checking
+						return '[%s] /*array of: %s*/' %(','.join(right), T)
 
 					elif node.left.func.id == '__go__arrayfixed__':
 						asize = self.visit(node.left.args[0])
 						atype = self.visit(node.left.args[1])
-						return ' new Array(%s) /*array of: %s*/' %(asize, atype)
+
+						if atype in ('ubyte', 'uint8', 'ui8'):
+							r = ' new Uint8Array(%s)' %asize
+						elif atype in ('byte' ,'int8', 'i8'):
+							r = ' new Int8Array(%s)' %asize
+						elif atype in ('short', 'int16', 'i16'):
+							r = ' new Int16Array(%s)' %asize
+						elif atype in ('ushort', 'uint16', 'ui16'):
+							r = ' new Uint16Array(%s)' %asize
+						elif atype in ('int', 'int32', 'i32'):
+							r = ' new Int32Array(%s)' %asize
+						elif atype in ('uint', 'uint32', 'ui32'):
+							r = ' new Uint32Array(%s)' %asize
+						elif atype in ('float', 'float32', 'f32'):
+							r = ' new Float32Array(%s)' %asize
+						elif atype in ('float64', 'f64', 'double'):
+							r = ' new Float64Array(%s)' %asize
+						else:
+							raise SyntaxError(self.format_error('invalid type for fixed-size typed arrays: '+atype))
+
+						if len(right):
+							return '__array_fill__(%s, [%s])' %(r, ','.join(right))
+						else:
+							return r
 
 		if self._with_oo:
 			methodnames = {
@@ -1045,6 +1414,8 @@ TODO clean this up
 				'%': 'mod'
 			}
 			return '(%s.__%s__(%s))' % (left, methodnames[op], right)
+		elif op=='*' and isinstance(node.left, ast.Str):
+			return '(%s.__mul__(%s))' % (left, right)
 		else:
 			return '(%s %s %s)' % (left, op, right)
 
@@ -1140,8 +1511,19 @@ If Test
 	def visit_If(self, node):
 		out = []
 		test = self.visit(node.test)
-		out.append( 'if (%s)' %test )
-		out.append( self.indent() + '{' )
+		if self._runtime_type_checking and not isinstance(node.test, ast.Compare):
+			## note in old-style-js `typeof(null)=='object'`,
+			## so we need to check first that the test is not null.
+			## this still works for functions, because `typeof(F)` is 'function'
+			#errmsg = 'if test not allowed directly on arrays, dicts, or objects. The correct syntax is: `if len(array)` or `if len(dict.keys())` or `if myob is not None`'
+			#out.append( 'if (%s!=null && typeof(%s)=="object") {throw new RuntimeError("%s")}' %(test, test, errmsg))
+
+			errmsg = 'if test not allowed directly on arrays. The correct syntax is: `if len(array)` or `if array.length`'
+			out.append( 'if (%s instanceof Array) {throw new RuntimeError("%s")}' %(test, errmsg))
+
+			out.append( self.indent() + 'if (%s) {' %test )
+		else:
+			out.append( 'if (%s) {' %test )
 
 		self.push()
 
@@ -1156,9 +1538,7 @@ If Test
 		self.pull()
 
 		if orelse:
-			out.append( self.indent() + '}')
-			out.append( self.indent() + 'else')
-			out.append( self.indent() + '{')
+			out.append( self.indent() + '} else {')
 			out.extend( orelse )
 
 		out.append( self.indent() + '}' )
@@ -1183,9 +1563,13 @@ when fast_loops is off much of python `for in something` style of looping is los
 
 ```python
 
-	def _visit_for_prep_iter_helper(self, node, out, iter_name):
-		if not self._fast_loops:
-			s = 'if (! (%s instanceof Array || typeof %s == "string" || 𝑰𝒔𝑻𝒚𝒑𝒆𝒅𝑨𝒓𝒓𝒂𝒚(%s) || 𝑰𝒔𝑨𝒓𝒓𝒂𝒚(%s) )) { %s = __object_keys__(%s) }' %(iter_name, iter_name, iter_name, iter_name, iter_name, iter_name)
+	def _visit_for_prep_iter_helper(self, node, out, iter_name, wrapped):
+		if not self._fast_loops or wrapped:
+			if typedpython.unicode_vars:
+				s = 'if (! (%s instanceof Array || typeof %s == "string" || 𝑰𝒔𝑻𝒚𝒑𝒆𝒅𝑨𝒓𝒓𝒂𝒚(%s) || 𝑰𝒔𝑨𝒓𝒓𝒂𝒚(%s) )) { %s = __object_keys__(%s) }' %(iter_name, iter_name, iter_name, iter_name, iter_name, iter_name)
+			else:
+				s = 'if (! (%s instanceof Array || typeof %s == "string" || __is_typed_array(%s) || __is_some_array(%s) )) { %s = __object_keys__(%s) }' %(iter_name, iter_name, iter_name, iter_name, iter_name, iter_name)
+
 			if len(out):
 				out.append( self.indent() + s )
 			else:
@@ -1216,19 +1600,25 @@ when fast_loops is off much of python `for in something` style of looping is los
 
 
 	def visit_For(self, node):
+		self._fast_loops = False  ## if true breaks builtins that for loop on special `arguments`
+		## TESTING fast loops always true, string iteration now requires `iter(s)` wrapped
+
 
 		target = node.target.id
 		iter = self.visit(node.iter) # iter is the python iterator
+		is_iter_wrapped = False
+		if iter.startswith('iter('):
+			is_iter_wrapped = True
+			iter = iter[5:-1]
 
 		out = []
 		body = []
 
-		#index = '_i%s' % self._iter_id
-		#index = '𝘪𝘯𝘥𝘦𝘹%s' %self._iter_id
-		if self._iter_id == 0:
+		if not typedpython.unicode_vars:
+			index = '__n%s' % self._iter_id
+		elif self._iter_id == 0:
 			index = '𝓷'
 		else:
-			#index = '𝓷%s' % self.remap_to_subscript(self._iter_id)
 			index = '𝓷%s' % self._iter_id
 
 
@@ -1238,8 +1628,10 @@ when fast_loops is off much of python `for in something` style of looping is los
 		## iterator, because _visit_for_prep_iter_helper might break it,
 		## by reassigning the original dict, to its keys (an array),
 		## later code in the block will then fail when it expects a dict.
-		if not self._fast_loops:
-			if isinstance(node.iter, ast.Name):
+		if not self._fast_loops or is_iter_wrapped:
+			if not typedpython.unicode_vars:
+				iname = '__iter%s' %self._iter_id
+			elif isinstance(node.iter, ast.Name):
 				iname = '𝕚𝕥𝕖𝕣%s' %iter
 			elif self._iter_id:
 				iname = '𝕚𝕥𝕖𝕣%s' %self._iter_id
@@ -1265,14 +1657,28 @@ when fast_loops is off much of python `for in something` style of looping is los
 			## the only safe way to omit _visit_for_prep_iter_helper is to check
 			## if the user had statically typed the iterator variable as a dict.
 			pass
-		self._visit_for_prep_iter_helper(node, out, iname)
 
-		if self._fast_loops:
-			out.append( 'for (var %s = 0; %s < %s.length; %s++)' % (index, index, iname, index) )
-			out.append( self.indent() + '{' )
+		## TESTING ##
+		self._visit_for_prep_iter_helper(node, out, iname, is_iter_wrapped)
+
+		if BLOCKIDS: out.append('/*BEGIN-FOR:%s*/' %iter)
+
+		if self._fast_loops and not is_iter_wrapped:
+
+			## iteration over strings not allowed in javascript backend without wrapping with `iter(mystr)` in the loop,
+			## example: `for char in iter(mystr)`
+			if self._runtime_type_checking:
+				out.append( self.indent() + 'if (typeof(%s)=="string") {throw new RuntimeError("string iteration error:\\n  wrap the string with `iter()`:\\n  example `for c in iter(mystr)`.\\n");}' %iname )
+				#breaks:DOM and typedarrys##out.append( self.indent() + 'if (!(__is_some_array(%s)){throw new RuntimeError("Array iteration error:\\n  wrap the object with `iter()`:\\n  example `for ob in iter(iterable)`.\\n");}' %iname )
+				out.append( self.indent() + 'if (!(%s instanceof Array)){throw new RuntimeError("Array iteration error:\\n  wrap the object with `iter()`:\\n  example `for ob in iter(iterable)`.\\n");}' %iname )
+
+			out.append( self.indent() + 'var %s = %s.length-1;' %(index, iname) )
+			out.append( self.indent() + '%s.reverse();' %iname )			
+			out.append( self.indent() + 'while (%s.length && %s+1) {' %(iname, index) )
 
 		else:
 			out.append( self.indent() + 'for (var %s = 0; %s < %s.length; %s++) {' % (index, index, iname, index) )
+
 		self.push()
 
 		if hasattr(self, '_in_timeout') and self._in_timeout:
@@ -1287,9 +1693,18 @@ when fast_loops is off much of python `for in something` style of looping is los
 		for line in list(map(self.visit, node.body)):
 			body.append( self.indent() + line )
 
+		if self._fast_loops and not is_iter_wrapped:
+			body.append( self.indent() + '%s--;' %index)
+
 		self.pull()
 		out.extend( body )
-		out.append( self.indent() + '}' )
+		if self._fast_loops and not is_iter_wrapped:
+			out.append( self.indent() + '} %s.reverse();' %iname )			
+		else:
+			out.append( self.indent() + '}' )
+
+
+		if BLOCKIDS: out.append( self.indent() + '/*END-FOR:%s*/' %self._fast_loops)
 
 		self._iter_id -= 1
 
@@ -1309,16 +1724,8 @@ Regenerate JS Runtime
 TODO: update and test generate new js runtimes
 
 ```python
-def generate_minimal_js_runtime():
-	from python_to_pythonjs import main as py2pyjs
-	a = py2pyjs(
-		open('src/runtime/builtins_core.py', 'rb').read(),
-		module_path = 'runtime',
-		fast_javascript = True
-	)
-	return main( a, requirejs=False, insert_runtime=False, function_expressions=True, fast_javascript=True )
 
-def generate_js_runtime( nodejs=False, nodejs_tornado=False ):
+def generate_js_runtime( nodejs=False, nodejs_tornado=False, webworker_manager=False, debugger=False ):
 	## note: RUSTHON_LIB_ROOT gets defined in the entry of rusthon.py
 	r = [
 		open(os.path.join(RUSTHON_LIB_ROOT,'src/runtime/pythonpythonjs.py'), 'rb').read(),
@@ -1329,6 +1736,17 @@ def generate_js_runtime( nodejs=False, nodejs_tornado=False ):
 		)
 
 	]
+
+	if debugger:
+		r.append(
+			python_to_pythonjs(
+				open(os.path.join(RUSTHON_LIB_ROOT,'src/runtime/builtins_debugger.py'), 'rb').read(),
+				fast_javascript = True,
+				pure_javascript = False
+			)
+		)
+
+
 	if nodejs:
 		r.append(
 			python_to_pythonjs(
@@ -1347,6 +1765,15 @@ def generate_js_runtime( nodejs=False, nodejs_tornado=False ):
 			)
 		)
 
+	if webworker_manager:
+		r.append(
+			python_to_pythonjs(
+				open(os.path.join(RUSTHON_LIB_ROOT,'src/runtime/builtins_webworker.py'), 'rb').read(),
+				fast_javascript = True,
+				pure_javascript = False
+			)
+		)
+
 
 	builtins = translate_to_javascript(
 		'\n'.join(r),
@@ -1356,7 +1783,7 @@ def generate_js_runtime( nodejs=False, nodejs_tornado=False ):
 		fast_loops = True,
 		runtime_checks = False
 	)
-
+	builtins += '\n/*end-builtins*/\n'
 	return builtins
 
 ```
@@ -1367,7 +1794,9 @@ html files can also be translated, it is parsed and checked for `<script type="t
 
 ```python
 
-def translate_to_javascript(source, requirejs=True, insert_runtime=True, webworker=False, function_expressions=True, fast_javascript=False, fast_loops=False, runtime_checks=True):
+def translate_to_javascript(source, requirejs=True, insert_runtime=True, webworker=False, function_expressions=True, fast_javascript=False, fast_loops=False, runtime_checks=True, as_module=False):
+	if '--debug-inter' in sys.argv:
+		raise RuntimeError(source)
 	head = []
 	tail = []
 	script = False
@@ -1439,7 +1868,8 @@ def translate_to_javascript(source, requirejs=True, insert_runtime=True, webwork
 		function_expressions=function_expressions,
 		fast_javascript = fast_javascript,
 		fast_loops      = fast_loops,
-		runtime_checks  = runtime_checks
+		runtime_checks  = runtime_checks,
+		as_module = as_module
 	)
 	output = gen.visit(tree)
 

@@ -48,7 +48,9 @@ class file:
 	def close(self):
 		pass
 
-def __open__( path, mode=None):  ## this can not be named `open` because it replaces `window.open`
+def __open__( path, mode):  ## this can not be named `open` because it replaces `window.open`
+	if mode is undefined:
+		mode = 'r'
 	return file( path, mode )
 
 
@@ -137,9 +139,14 @@ os = _fake_os()
 
 class _fake_sys:
 	def __init__(self):
-		self.stdin = process.stdin
-		self.stdout = process.stdout
-		self.stderr = process.stderr
+		if process.platform=='win32':  ## not available on mswindows
+			self.stdin = None
+			self.stdout = None
+			self.stderr = None
+		else:
+			self.stdin = process.stdin
+			self.stdout = process.stdout
+			self.stderr = process.stderr
 		self.argv = process.argv
 
 	def exit(self):

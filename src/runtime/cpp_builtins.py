@@ -3,6 +3,18 @@
 # License: "New BSD"
 
 
+## note the caller must catch and clean up using `free` on errors
+## `catch (...)` will leak memory, and should only be a fallback
+## from external c++ libs that throw const references of std::exception
+def RuntimeError( msg:string ) -> std::runtime_error*:
+	prefix = "RuntimeError|"
+	return inline('new std::runtime_error(prefix+msg)')
+
+def IOError( msg:string ) -> std::runtime_error*:
+	prefix = "IOError|"
+	return inline('new std::runtime_error(prefix+msg)')
+
+
 #def __split_string_py__(s:string, m:string) ->[]string:
 #	vec = []string("")
 #	for c in s:
@@ -11,6 +23,25 @@
 #		else:
 #			vec[-1] += c
 #	return vec
+
+
+## note: try/catch can be optional to be compatible with external build tools that disable exceptions
+def __open__( name:string, mode: string) -> std::fstream*:
+	try:
+		let s : std::fstream*
+
+		if mode=="rb" or mode=="r":
+			options = inline('std::fstream::in | std::fstream::binary')
+			s = new std::fstream(name.c_str(), options)
+		else:
+			s = new std::fstream(name.c_str(), std::fstream::out | std::fstream::binary)
+		with pointers:
+			s.exceptions( std::ios::failbit | std::ios::badbit | std::ios::eofbit )
+		return s
+	except:
+		inline('throw IOError(std::string("No such file or directory: ")+name)')
+
+
 
 inline("""
 
@@ -73,14 +104,6 @@ std::string str( int s ) {
 	return std::to_string(s);
 }
 
-std::fstream* __open__(const std::string name, const std::string mode) {
-	if (mode==std::string("rb")) {
-		return new std::fstream(name.c_str(), std::fstream::in | std::fstream::binary);
-	} else {
-		return new std::fstream(name.c_str(), std::fstream::out | std::fstream::binary);
-	}
-}
-
 std::string readfile(std::fstream* f) {
 	std::ostringstream c;
 	c << f->rdbuf();
@@ -138,4 +161,14 @@ std::string chr( int c ) {
 	return std::string( &s );
 }
 
+std::string __parse_error_type__( std::runtime_error* err) {
+	auto vec = __split_string__( std::string(err->what()), std::string("|") );
+	return (*vec)[0];
+}
+
+/*end-builtins*/
 """)
+
+
+
+

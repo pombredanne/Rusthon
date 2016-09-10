@@ -11,7 +11,8 @@ Richards
 #  Translation from C++, Mario Wolczko
 #  Outer loop added by Alex Jacoby
 
-from time import time
+from time import clock
+from runtime import *
 
 # Task IDs
 I_IDLE = 1
@@ -191,8 +192,8 @@ class Task(TaskState):
 			p.append_to(self.input)
 		return old
 
-
-	def runTask(self):
+	#@v8
+	def runTask(self):  ## most CPU load
 		if self.isWaitingWithPacket():
 			msg = self.input
 			self.input = msg.link
@@ -250,7 +251,7 @@ class DeviceTask(Task):
 
 	def fn(self,pkt,r):
 		d = r
-		assert isinstance(d, DeviceTaskRec)
+		#assert isinstance(d, DeviceTaskRec)
 		if pkt is None:
 			pkt = d.pending
 			if pkt is None:
@@ -271,7 +272,7 @@ class HandlerTask(Task):
 
 	def fn(self,pkt,r):
 		h = r
-		assert isinstance(h, HandlerTaskRec)
+		#assert isinstance(h, HandlerTaskRec)
 		if pkt is not None:
 			if pkt.kind == K_WORK:
 				h.workInAdd(pkt)
@@ -303,7 +304,7 @@ class IdleTask(Task):
 
 	def fn(self,pkt,r):
 		i = r
-		assert isinstance(i, IdleTaskRec)
+		#assert isinstance(i, IdleTaskRec)
 		i.count -= 1
 		if i.count == 0:
 			return self.hold()
@@ -326,7 +327,7 @@ class WorkTask(Task):
 
 	def fn(self,pkt,r):
 		w = r
-		assert isinstance(w, WorkerTaskRec)
+		#assert isinstance(w, WorkerTaskRec)
 		if pkt is None:
 			return self.waitTask()
 
@@ -347,7 +348,6 @@ class WorkTask(Task):
 
 		return self.qpkt(pkt)
 
-
 def schedule():
 	t = taskWorkArea.taskList
 	while t is not None:
@@ -361,6 +361,7 @@ def schedule():
 		else:
 			if tracing: trace(chr(ord("0")+t.ident))
 			t = t.runTask()
+
 
 class Richards(object):
 
@@ -400,17 +401,27 @@ class Richards(object):
 
 def entry_point(iterations):
 	r = Richards()
-	startTime = time()
+
+	## before bench timer let v8 type infer the method
+	## types so it can be JIT on next call, set by `v8(func)`
+	#r.run(1)
+	#v8(r.run)
+	## above works, but it can also be done in a single line with `->` syntax
+	v8->( r.run(1) )
+
+	startTime = clock()
 	result = r.run(iterations)
 	if not result:
 		print('#ERROR incorrect results!')
-	return time() - startTime
+	return clock() - startTime
 
 def main():
-	iterations=10
+	iterations=20
 	#print("#Richards benchmark (Python) starting. iterations="+str(iterations))
 	total_s = entry_point(iterations)
 	#print("#Total time for %s iterations: %s secs" %(iterations,total_s))
 	s = total_s / iterations
 	#print("#Average seconds per iteration:", s)
 	print(s)
+
+main()

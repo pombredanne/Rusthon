@@ -1,7 +1,8 @@
 Go Translator
 -------------
 
-subclass'es from the javascript generator.
+note: The GoGenerator class subclasses from javascript generator.
+
 
 ```python
 
@@ -39,10 +40,24 @@ class GoGenerator( JSGenerator ):
 		self.uids = 0
 		self.unodes = dict()
 
+		self._slice_hack_id = 0
+
 	def uid(self):
 		self.uids += 1
 		return self.uids
 
+
+	def visit_Import(self, node):
+		r = [alias.name.replace('__SLASH__', '/') for alias in node.names]
+		res = []
+		if r:
+			for name in r:
+				self._imports.add('import("%s");' %name)
+
+		if res:
+			return '\n'.join(res)
+		else:
+			return ''
 
 	def visit_Str(self, node):
 		s = node.s.replace("\\", "\\\\").replace('\n', '\\n').replace('\r', '\\r').replace('"', '\\"')
@@ -255,7 +270,7 @@ class GoGenerator( JSGenerator ):
 			## used by generics to workaround the problem that a super method that returns `self`,
 			## may infact return wrong subclass type, because a struct to return that is not of type
 			## self will be cast to self - while this is ok if just reading attributes from it,
-			## it fails with method calls, because the casting operation on the struct changes it's
+			## it fails with method calls, because the casting operation on the struct changes its
 			## method pointers.  by storing the class name on the instance, it can be used in a generics
 			## type switch to get to the real class and call the right methods.
 			out.append( '  ob.__class__ = "%s"' %node.name)
@@ -301,12 +316,12 @@ class GoGenerator( JSGenerator ):
 			else:
 				r = '(*%s)[%s]' % (self.visit(node.value), self.visit(node.slice))
 
-			if isinstance(node.value, ast.Name) and node.value.id in self._known_arrays:
-				target = node.value.id
-				#value = self.visit( node.value )
-				cname = self._known_arrays[target]
-				#raise GenerateGenericSwitch( {'target':target, 'value':r, 'class':cname} )
-				raise GenerateGenericSwitch( {'value':r, 'class':cname} )
+			#if isinstance(node.value, ast.Name) and node.value.id in self._known_arrays:
+			#	target = node.value.id
+			#	#value = self.visit( node.value )
+			#	cname = self._known_arrays[target]
+			#	#raise GenerateGenericSwitch( {'target':target, 'value':r, 'class':cname} )
+			#	raise GenerateGenericSwitch( {'value':r, 'class':cname} )
 
 			return r
 
@@ -365,6 +380,8 @@ class GoGenerator( JSGenerator ):
 						lines.append( sub )
 			else:
 				if isinstance(b, ast.Import):
+					pass
+				elif isinstance(b, ast.ImportFrom):
 					pass
 				else:
 					raise SyntaxError(b)
@@ -450,14 +467,40 @@ class GoGenerator( JSGenerator ):
 		if fname.endswith('.append'):
 			is_append = True
 			arr = fname.split('.append')[0]
+		####################################
+		if fname=='main':  ## can not directly call `main` in Go
+			return '/*run main*/'
+		elif fname == '__arg_array__':
+			assert len(node.args)==1
+			T = self.parse_go_style_arg(node.args[0])
+			if self.is_prim_type(T):
+				return '*[]%s' %T
+			else:
+				return '*[]*%s' %T
 
-		#if fname=='__DOLLAR__': fname = '$'
-		if fname == 'range':
+		elif fname=='__let__':
+			if len(node.args) and isinstance(node.args[0], ast.Attribute): ## syntax `let self.x:T = y`
+				assert node.args[0].value.id == 'self'
+				assert len(node.args)==3
+				T = None
+				value = self.visit(node.args[2])
+				if isinstance(node.args[1], ast.Str):
+					T = node.args[1].s
+				else:
+					T = self.visit(node.args[1])
+
+				return 'self.%s = %s' %(node.args[0].attr, self.visit(node.args[2]))
+			else:
+				raise RuntimeError('TODO let...')
+
+
+		elif fname == 'range':  ## hack to support range builtin, translates to `range1,2,3`
 			assert len(node.args)
 			fname += str(len(node.args))
 		elif fname == 'len':
 			return 'len(*%s)' %self.visit(node.args[0])
 		elif fname == 'go.type_assert':
+			raise RuntimeError('go.type_assert is deprecated')
 			val = self.visit(node.args[0])
 			type = self.visit(node.args[1])
 			raise GenerateTypeAssert( {'type':type, 'value':val} )
@@ -525,9 +568,14 @@ class GoGenerator( JSGenerator ):
 						if node.func.attr in self.method_returns_multiple_subclasses[ cname ]:
 							raise SyntaxError('%s(%s)' % (fname, args))
 
+			if fname in self._classes:
+				fname = '__new__%s' %fname
 
 			return '%s(%s)' % (fname, args)
 
+
+	def visit_Assert(self, node):
+		return 'if ((%s) == false) { panic("assertion failed"); }' %self.visit(node.test)
 
 
 	def visit_BinOp(self, node):
@@ -536,7 +584,12 @@ class GoGenerator( JSGenerator ):
 		right = self.visit(node.right)
 
 		if op == '>>' and left == '__new__':
-			return ' new %s' %right
+			## calls generated class constructor: user example `new MyClass()` ##
+			## for rare cases where the translator is not aware of some transpiled class ##
+			if not right.startswith('__new__'):
+				return '__new__%s' %right
+			else:
+				return right
 
 		elif op == '<<':
 			if left in ('__go__receive__', '__go__send__'):
@@ -642,6 +695,10 @@ class GoGenerator( JSGenerator ):
 		if self._function_stack[0] is node:
 			self._vars = set()
 			self._known_vars = set()
+			self._known_instances = dict()
+			self._known_arrays    = dict()
+
+
 		elif len(self._function_stack) > 1:
 			## do not clear self._vars and _known_vars inside of closure
 			is_closure = True
@@ -653,6 +710,12 @@ class GoGenerator( JSGenerator ):
 		generics = set()
 		args_generics = dict()
 		returns_self = False
+		use_generics = False
+
+		for decor in node.decorator_list:
+			if isinstance(decor, ast.Name) and decor.id=='generic':
+				use_generics = True
+
 
 		for decor in node.decorator_list:
 			if isinstance(decor, ast.Call) and isinstance(decor.func, ast.Name) and decor.func.id == '__typedef__':
@@ -663,7 +726,7 @@ class GoGenerator( JSGenerator ):
 						args_typedefs[ key.arg ] = self.visit(key.value)
 
 					## check for super classes - generics ##
-					if args_typedefs[ key.arg ] in self._classes:
+					if use_generics and args_typedefs[ key.arg ] in self._classes:
 						if node.name=='__init__':
 							## generics type switch is not possible in __init__ because
 							## it is used to generate the type struct, where types are static.
@@ -697,6 +760,10 @@ class GoGenerator( JSGenerator ):
 					returns_self = True
 					self.method_returns_multiple_subclasses[ self._class_stack[-1].name ].add(node.name)
 
+		if return_type and not self.is_prim_type(return_type):
+			if not return_type.startswith('*') and not return_type.startswith('&') and not return_type.startswith('func('):
+				return_type = '*'+return_type
+
 		node._arg_names = args_names = []
 		args = []
 		oargs = []
@@ -720,8 +787,13 @@ class GoGenerator( JSGenerator ):
 			if arg_name in args_typedefs:
 				arg_type = args_typedefs[arg_name]
 				#if generics and (i==0 or (is_method and i==1)):
-				if generics and arg_name in args_generics.keys():  ## TODO - multiple generics in args
+				if use_generics and generics and arg_name in args_generics.keys():  ## TODO - multiple generics in args
 					a = '__gen__ %s' %arg_type
+				elif self.is_prim_type(arg_type):
+					a = '%s %s' %(arg_name, arg_type)
+				elif not arg_type.startswith('*') and not arg_type.startswith('&') and not arg_type.startswith('func('):
+					## assume pointer ##
+					a = '%s *%s' %(arg_name, arg_type)
 				else:
 					a = '%s %s' %(arg_name, arg_type)
 			else:
@@ -768,28 +840,25 @@ class GoGenerator( JSGenerator ):
 		out = []
 		if is_closure:
 			if return_type:
-				out.append( self.indent() + '%s := func (%s) %s {\n' % (node.name, ', '.join(args), return_type) )
+				out.append( '%s := func (%s) %s {\n' % (node.name, ', '.join(args), return_type) )
 			else:
-				out.append( self.indent() + '%s := func (%s) {\n' % (node.name, ', '.join(args)) )
+				out.append( '%s := func (%s) {\n' % (node.name, ', '.join(args)) )
 		else:
 			if return_type:
-				out.append( self.indent() + 'func %s%s(%s) %s {\n' % (method, node.name, ', '.join(args), return_type) )
+				out.append( 'func %s%s(%s) %s {\n' % (method, node.name, ', '.join(args), return_type) )
 			else:
-				out.append( self.indent() + 'func %s%s(%s) {\n' % (method, node.name, ', '.join(args)) )
+				out.append( 'func %s%s(%s) {\n' % (method, node.name, ', '.join(args)) )
 		self.push()
 
 		if oargs:
 			for n,v in oargs:
-				out.append('%s := %s' %(n,v))
-				out.append('if __kwargs.__use__%s {' %n )
-				out.append( '  %s = __kwargs.%s' %(n,n))
-				out.append('}')
-				#out.append('} else { %s := %s }' %(n,v))
+				out.append(self.indent() + '%s := %s' %(n,v))
+				out.append(self.indent() + 'if __kwargs.__use__%s { %s = __kwargs.%s }' %(n,n,n))
 
 		if starargs:
-			out.append('%s := &__vargs__' %starargs)
+			out.append(self.indent() + '%s := &__vargs__' %starargs)
 
-		if generics:
+		if use_generics and generics:
 			gname = args_names[ args_names.index(args_generics.keys()[0]) ]
 
 			#panic: runtime error: invalid memory address or nil pointer dereference
@@ -902,15 +971,27 @@ class GoGenerator( JSGenerator ):
 				#raise NotImplementedError('TODO other generic function return types', return_type)
 				out.append(self.indent() + 'return %s' %(return_type.replace('*','&')+'{}'))
 
-		else:
+		elif use_generics: ## no generics in args, generate generics caller switching
 			body = node.body[:]
 			body.reverse()
-			#self._scope_stack.append( (self._vars, self._known_vars))
 			self.generate_generic_branches( body, out, self._vars, self._known_vars )
-			#for b in node.body:
+
+		else: ## without generics ##
+			for b in node.body:
+				out.append(self.indent()+self.visit(b))
+
 		self._scope_stack = []
 
+		if is_method and return_type and node.name.endswith('__init__'):
+			## note: this could be `__init__` or `ParentClass__init__`.
+			has_return = False
+			for ln in out:
+				if ln.strip().startswith('return '):
+					has_return = True
+					break
 
+			if not has_return:
+				out.append('return self')
 
 		self.pull()
 		out.append( self.indent()+'}' )
@@ -1036,6 +1117,13 @@ class GoGenerator( JSGenerator ):
 
 		target = self.visit( node.targets[0] )
 
+
+		if isinstance(node.value, ast.BinOp) and self.visit(node.value.op)=='<<' and isinstance(node.value.left, ast.Call) and node.value.left.func.id=='__go__map__':
+			if isinstance(node.value.right, ast.Name) and node.value.right.id.startswith('__comp__'):
+				value = self.visit(node.value.right)
+				return '%s := %s;' % (target, value)  ## copy the map comprehension from the temp var to the original.
+
+		################
 		if isinstance(node.value, ast.BinOp) and self.visit(node.value.op)=='<<' and isinstance(node.value.left, ast.Name) and node.value.left.id=='__go__send__':
 			value = self.visit(node.value.right)
 			return '%s <- %s;' % (target, value)
@@ -1044,7 +1132,7 @@ class GoGenerator( JSGenerator ):
 			value = self.visit(node.value)
 			#return 'var %s = %s;' % (target, value)
 			if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id in self._classes:
-				value = '__new__' + value
+				#value = '__new__' + value
 				return 'var %s *%s = %s;' % (target, node.value.func.id, value)
 			else:
 				return 'var %s = %s;' % (target, value)
@@ -1060,7 +1148,8 @@ class GoGenerator( JSGenerator ):
 
 			if value.startswith('&(*') and '[' in value and ']' in value:  ## slice hack
 				v = value[1:]
-				return '_tmp := %s; %s := &_tmp;' %(v, target)
+				self._slice_hack_id += 1
+				return '__slice%s := %s; %s := &__slice%s;' %(self._slice_hack_id, v, target, self._slice_hack_id)
 
 			elif isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute) and isinstance(node.value.func.value, ast.Name):
 				varname = node.value.func.value.id
@@ -1078,9 +1167,8 @@ class GoGenerator( JSGenerator ):
 				if node.value.func.id in self._classes:
 					#raise SyntaxError(value+' in classes')
 					self._known_instances[ target ] = node.value.func.id
-					return '%s := __new__%s;' %(target, value)
-				else:
-					return '%s := %s;' % (target, value)
+
+				return '%s := %s;' % (target, value)
 
 			else:
 				return '%s := %s;' % (target, value)
@@ -1114,16 +1202,11 @@ class GoGenerator( JSGenerator ):
 
 
 def translate_to_go(script, insert_runtime=True):
-
+	if '--debug-inter' in sys.argv:
+		raise RuntimeError(script)
 	if insert_runtime:
-		dirname = os.path.dirname(os.path.abspath(__file__))
-		dirname = os.path.join(dirname, os.path.join('src','runtime'))
-		runtimepath = os.path.join(dirname, 'go_builtins.py')
-		if os.path.isfile(runtimepath):
-			runtime = open( runtimepath,'rb' ).read()
-			script = runtime + '\n' + script
-		else:
-			print 'WARNING: can not find go_builtins.py'
+		runtime = open( os.path.join(RUSTHON_LIB_ROOT, 'src/runtime/go_builtins.py') ).read()
+		script = runtime + '\n' + script
 
 	try:
 		tree = ast.parse(script)
@@ -1135,14 +1218,19 @@ def translate_to_go(script, insert_runtime=True):
 	g.visit(tree) # first pass gathers classes
 	pass2 = g.visit(tree)
 
-	## default path on linux from the offical Go docs ##
-	exe = '/usr/local/go/bin/go'  
+
+	## linux package: apt-get install golang
+	exe = '/usr/bin/go'
 	if not os.path.isfile(exe):
-		exe = os.path.expanduser('~/go/bin/go')  ## fall back to user home directory
+		## default path on linux from the offical Go docs - installed with their installer ##
+		exe = '/usr/local/go/bin/go'  
 		if not os.path.isfile(exe):
-			#raise RuntimeError('go not found in ~/go/bin/go')
-			print 'WARNING could not find go compiler, the generated code may not compile'
-			return pass2
+			exe = os.path.expanduser('~/go/bin/go')  ## fall back to user home directory
+			if not os.path.isfile(exe):
+				print 'WARNING: could not find go compiler'
+				print 'only a single translation pass was performed'
+				print '(the generated code may not compile)'
+				return pass2
 
 	## this hack runs the code generated in the second pass into the Go compiler to check for errors,
 	## where an interface could not be type asserted, because Go found that the variable was not an interface,

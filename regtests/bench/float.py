@@ -4,21 +4,16 @@ float numbers
 
 from time import clock
 from math import sin, cos, sqrt
+from runtime import *
 
 def main():
-	if PYTHON=='PYTHONJS':
-		pythonjs.configure( direct_operator='+' )
-		pythonjs.configure( direct_operator='*' )
-		pythonjs.configure( direct_keys=True )
-		pass
-
 	times = test( 3 )
 	avg = sum(times) / len(times)
 	print( avg )
 
 
-class Point(object):
-
+#class Point(object):  ## not allowed in RapydScript
+class Point:
 	def __init__(self, i):
 		self.x = sin(i)
 		self.y = cos(i) * 3
@@ -43,7 +38,6 @@ class Point(object):
 def maximize(points):
 	next = points[0]
 	for p in points[1:]:
-		assert isinstance(p, Point)
 		next = next.maximize(p)
 	return next
 
@@ -52,7 +46,6 @@ def benchmark(n):
 	for i in range(n):
 		points[i] = Point(i)
 	for p in points:
-		assert isinstance(p, Point)
 		p.normalize()
 	return maximize(points)
 
@@ -67,3 +60,5 @@ def test(arg):
 		times.append(tk - t0)
 	return times
 	
+
+main()

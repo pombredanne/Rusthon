@@ -10,7 +10,9 @@ RUSTHON_LIB_ROOT = os.path.dirname(unicode(os.path.realpath(__file__), sys.getfi
 
 
 GO_EXE = None
-if os.path.isfile('/usr/local/go/bin/go'):
+if os.path.isfile('/usr/bin/go'):
+	GO_EXE = '/usr/bin/go'
+elif os.path.isfile('/usr/local/go/bin/go'):
 	GO_EXE = '/usr/local/go/bin/go'
 elif os.path.isfile(os.path.expanduser('~/go/bin/go')):
 	GO_EXE = os.path.expanduser('~/go/bin/go')
@@ -18,6 +20,15 @@ elif os.path.isfile(os.path.expanduser('~/go/bin/go')):
 nodewebkit_runnable = False
 nodewebkit = os.path.expanduser('~/nwjs-v0.12.2-linux-x64/nw')
 if os.path.isfile( nodewebkit ): nodewebkit_runnable = True
+else:
+	nodewebkit = os.path.expanduser('~/nwjs-v0.12.3-linux-x64/nw')
+	if os.path.isfile( nodewebkit ): nodewebkit_runnable = True
+
+if sys.platform=='darwin':
+	nodewebkit = os.path.expanduser('~/nwjs-v0.12.3-osx-x64/nwjs.app/Contents/MacOS/nwjs')
+	if os.path.isfile( nodewebkit ):
+		nodewebkit_runnable = True
+
 
 ## special case for linux, just for debugging, look for google-chrome,
 ## if found then use it to launch tests, with the --disable-gpu-sandbox
@@ -32,8 +43,15 @@ CHROME_EXE = None
 #elif os.path.isfile('/opt/google/chrome/google-chrome'):
 #	CHROME_EXE = '/opt/google/chrome/google-chrome'
 
+## on fedora nodejs command is `node`, but on others it can be `nodejs`
+nodejs_exe = 'node'
+if os.path.isfile('/usr/sbin/ax25-node'):
+	if os.path.isfile('/usr/sbin/node'):
+		if os.path.realpath('/usr/sbin/node') == '/usr/sbin/ax25-node':
+			nodejs_exe = 'nodejs'
+
 JS_WEBWORKER_HEADER = u'''
-var __𝕦𝕚𝕕__ = 1;
+var __$UID$__ = 1;
 var __construct__ = function(constructor, args) {
 	function F() {
 		return constructor.apply(this, args);
@@ -43,9 +61,40 @@ var __construct__ = function(constructor, args) {
 };
 
 var __instances__ = {};
+var __bin__  = null;
 self.onmessage = function (evt) {
-	var msg = evt.data;
 	var id;
+	if (__bin__) {
+		var bmsg;
+		if (__bin__.type=="Float32Array") {
+			bmsg = new Float32Array(evt.data);
+		} else if (__bin__.type=="Float64Array") {
+			bmsg = new Float64Array(evt.data);
+		} // TODO other types
+
+		if (__bin__.send_binary) {
+			id = __bin__.send_binary;
+			var ob = __instances__[id];
+			var re = ob.send(bmsg);
+			if (re !== undefined) {
+				if (ob.send.returns=="Float32Array") {
+					self.postMessage({'id':id, 'bin':ob.send.returns});
+					self.postMessage(re.buffer, [re.buffer]);
+				} else {
+					self.postMessage({'id':id, 'message':re, 'proto':ob.send.returns});
+				}
+			}
+		}
+		__bin__ = null;
+		return;
+	}
+	var msg = evt.data;
+
+	if (msg.send_binary) {
+		// should assert here that __bin__ is null
+		__bin__ = msg;
+		return;
+	}
 	if (msg['spawn']) {
 		id = msg.spawn;
 		self.postMessage({debug:"SPAWN:"+id});
@@ -104,6 +153,58 @@ self.onmessage = function (evt) {
 }
 '''
 
+OPENSHIFT_PY = [
+u'''#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+import os
+
+virtenv = os.environ['OPENSHIFT_PYTHON_DIR'] + '/virtenv/'
+virtualenv = os.path.join(virtenv, 'bin/activate_this.py')
+try:
+    execfile(virtualenv, dict(__file__=virtualenv))
+except IOError:
+    pass
+#
+# IMPORTANT: Put any additional includes below this line.  If placed above this
+# line, it's possible required libraries won't be in your searchable path
+#
+from base64 import b64decode
+INDEX_HTML = b64decode("%s")
+''',  ## header
+
+u'''
+def application(environ, start_response):
+
+    ctype = 'text/plain'
+    if environ['PATH_INFO'] == '/health':
+        response_body = "1"
+    elif environ['PATH_INFO'] == '/env':
+        response_body = ['%s: %s' % (key, value)
+                    for key, value in sorted(environ.items())]
+        response_body = '\\n'.join(response_body)
+    else:
+        ctype = 'text/html'
+        response_body = INDEX_HTML
+
+    status = '200 OK'
+    response_headers = [('Content-Type', ctype), ('Content-Length', str(len(response_body)))]
+    #
+    start_response(status, response_headers)
+    return [response_body]
+
+#
+# Below for testing only
+#
+if __name__ == '__main__':
+    from wsgiref.simple_server import make_server
+    httpd = make_server('localhost', 8051, application)
+    # Wait for a single request, serve it and quit.
+    httpd.handle_request()
+''']
+
+
+
 def compile_js( script, module_path, main_name='main', directjs=False, directloops=False ):
 	'''
 	directjs = False     ## compatible with pythonjs-minimal.js
@@ -150,6 +251,7 @@ def compile_js( script, module_path, main_name='main', directjs=False, directloo
 
 		code = translate_to_javascript(
 			pyjs,
+			as_module='--ES6-module' in sys.argv,
 			requirejs=False,
 			insert_runtime=False,
 			fast_javascript = fastjs,
@@ -268,6 +370,8 @@ def new_module():
 		'nim'     : [],
 		'xml'     : [],
 		'json'    : [],
+		'bazel'   : [],
+		'gyp'     : [],
 		'rapydscript':[],
 		'javascript':[],
 	}
@@ -311,8 +415,8 @@ def import_md( url, modules=None, index_offset=0, force_tagname=None ):
 							else:
 								rusthonpy.append(rln)
 						rusthonpy = '\n'.join(rusthonpy)
-						utfheader = '# -*- coding: utf-8 -*-\n'
-						code.insert(0, utfheader + BOOTSTRAPED + '\n' + rusthonpy)
+						utfheader = u'# -*- coding: utf-8 -*-\n'
+						code.insert(0, utfheader + BOOTSTRAPED + '\n' + rusthonpy.decode('utf-8'))
 						code.pop(code.index('from rusthon import *'))
 
 					p, n = os.path.split(url)
@@ -384,7 +488,36 @@ def hack_nim_stdlib(code):
 	return '\n'.join(out)
 
 
+def is_restricted_bash( line ):
+	if '&&' in line:
+		return False
+	if "`" in line:
+		return False
+	if '"' in line:
+		return False
+
+	okcmds = [
+		'./configure', 
+		'make', 'cmake', 
+		'scons', 'bazel', 
+		'cd', 'mkdir', 'cp', #'pwd', 'ls',
+		'npm', 'grunt', 'gyp', 'nw-gyp',
+		'apt-get', 'yum',
+		'pip', 'docker', 'rhc',
+	]
+	cmd = line.split()[0]
+	if cmd == 'sudo': cmd = line.split()[1]
+
+	if cmd in okcmds:
+		return True
+	else:
+		return False
+
+GITCACHE = os.path.expanduser('~/rusthon_cache')
+
 def build( modules, module_path, datadirs=None ):
+	if '--debug-build' in sys.argv:
+		raise RuntimeError(modules)
 	output = {'executeables':[], 'rust':[], 'c':[], 'c++':[], 'c#':[], 'go':[], 'javascript':[], 'java':[], 'xml':[], 'json':[], 'python':[], 'html':[], 'verilog':[], 'nim':[], 'lua':[], 'dart':[], 'datadirs':datadirs, 'datafiles':{}}
 	python_main = {'name':'main.py', 'script':[]}
 	go_main = {'name':'main.go', 'source':[]}
@@ -395,6 +528,66 @@ def build( modules, module_path, datadirs=None ):
 	nim_wrappers = []
 	libdl = False ## provides: dlopen, dlclose, for dynamic libs. Nim needs this
 	cached_json = {}
+	gyp_builds  = {}
+
+	if modules['bash']:
+		for mod in modules['bash']:
+			if 'tag' in mod and mod['tag']:
+				tag = mod['tag']
+				if tag.startswith('http://') or tag.startswith('https://'):
+					if not tag.endswith('.git'):
+						raise SyntaxError('only git repos links are allowed: '+tag)
+					if not os.path.isdir(GITCACHE):
+						print 'making new rusthon cache folder: ' + GITCACHE
+						os.mkdir(GITCACHE)
+
+					gitname = tag.split('/')[-1][:-4]
+					projectdir = os.path.join(GITCACHE, gitname)
+
+					rebuild = True
+					if gitname not in os.listdir(GITCACHE):
+						cmd = ['git', 'clone', tag]
+						subprocess.check_call(cmd, cwd=GITCACHE)
+					elif '--git-sync' in sys.argv:
+						cmd = ['git', 'pull']
+						subprocess.check_call(cmd, cwd=projectdir)
+					else:
+						rebuild = False
+
+					if rebuild or '--force-rebuild-deps' in sys.argv:
+						print 'rebuilding git repo: ' + tag
+						## TODO restrict the bash syntax allowed here,
+						## or build it in a sandbox or docker container.
+						for line in mod['code'].splitlines():
+							if not line.strip(): continue
+							if not is_restricted_bash(line):
+								raise SyntaxError('bash build script syntax is restricted:\n'+line)
+							else:
+								print '>>'+line
+							subprocess.check_call( line.split(), cwd=projectdir )
+
+				else:
+					output['datafiles'][tag] = mod['code']
+
+
+	if modules['gyp']:
+		for mod in modules['gyp']:
+			if 'tag' in mod and mod['tag']:
+				if not mod['tag'] != 'binding.gyp':
+					raise RuntimeError('nw-gyp requires the gyp file is named `binding.gyp`')
+
+			output['datafiles']['binding.gyp'] = mod['code']
+
+			gypcfg = json.loads( mod['code'].replace("'", '"') )
+			#if len(gypcfg['targets']) > 1:
+			#	continue
+			for gtarget in gypcfg['targets']:
+				for gsrc in gtarget['sources']:
+					gyp_builds[ gsrc ] = {
+						'gyp':mod['code'],
+						'src': None
+					}
+
 
 	if modules['javascript']:
 		for mod in modules['javascript']:
@@ -438,7 +631,7 @@ def build( modules, module_path, datadirs=None ):
 			tmprapyd = tempfile.gettempdir() + '/temp.rapyd'
 			tmpjs = tempfile.gettempdir() + '/rapyd-output.js'
 			open(tmprapyd, 'wb').write(mod['code'].encode('utf-8'))
-			subprocess.check_call(['rapydscript', tmprapyd, '--screw-ie8', '--bare', '--output', tmpjs])
+			subprocess.check_call(['rapydscript', tmprapyd, '--bare', '--output', tmpjs])
 			rapydata = open(tmpjs,'rb').read()
 			output['datafiles'][mod['tag']] = rapydata
 			tagged[ mod['tag'] ] = rapydata
@@ -559,6 +752,7 @@ def build( modules, module_path, datadirs=None ):
 	cpp_defines = []
 	compile_mode = 'binary'
 	exename = 'rusthon-test-bin'
+	tagged_trans_src = {}
 
 
 	if modules['rusthon']:
@@ -590,15 +784,27 @@ def build( modules, module_path, datadirs=None ):
 					exename = mod['tag']
 
 				## user named output for external build tools that need .h,.hpp,.cpp, files output to hardcoded paths.
-				if mod['tag'] and (mod['tag'].endswith('.h') or mod['tag'].endswith('.hpp') or mod['tag'].endswith('.cpp')):
+				if mod['tag'] and (mod['tag'].endswith('.h') or mod['tag'].endswith('.hpp') or mod['tag'].endswith('.cpp') or mod['tag'].endswith('.cc')):
 					pyjs = python_to_pythonjs(script, cpp=True, module_path=module_path)
+					use_try = True
+					if '--no-except' in sys.argv:
+						use_try = False
+					elif mod['tag'] in gyp_builds.keys():  ## nw-gyp builds without c++ exceptions
+						use_try = False
+
 					pak = translate_to_cpp(
 						pyjs, 
 						cached_json_files=cached_json, 
-						insert_runtime=False
+						insert_runtime=mod['tag'] in gyp_builds.keys(),
+						use_try = use_try
 					)
+					if '--debug-c++' in sys.argv:
+						raise RuntimeError(pak)
 					## pak contains: c_header and cpp_header
 					output['datafiles'][ mod['tag'] ] = pak['main']  ## save to output c++ to tar
+
+					if mod['tag'] in gyp_builds.keys():
+						gyp_builds[ mod['tag'] ]['src'] = pak['main']
 
 					if 'user-headers' in pak:
 						for classtag in pak['user-headers'].keys():
@@ -635,6 +841,7 @@ def build( modules, module_path, datadirs=None ):
 					js = compile_js( mod['code'], module_path, main_name=mod['tag'] )
 					mod['build'] = {'script':js[mod['tag']]}
 					tagged[ mod['tag'] ] = js[mod['tag']]
+					tagged_trans_src[ mod['tag'] ] = mod['code']  ## so user can embed original source using <!tagname>
 					for name in js:
 						output['javascript'].append( {'name':name, 'script':js[name], 'index': index} )
 				else:
@@ -657,30 +864,23 @@ def build( modules, module_path, datadirs=None ):
 				output['dart'].append( {'name':name, 'script':dartcode, 'index': index} )
 
 	if js_merge:
-		tagname = None
-		src = []
+		taggroups = {}
 		for mod in js_merge:
-			if mod['tag']:
-				if tagname is not None:
-					raise RuntimeError('TODO multiple tag insertions')
-				tagname = mod['tag']
-				src.append( mod['code'] )
-			else:
-				src.append(mod['code'])
+			tagname = mod['tag']
+			if tagname not in taggroups:
+				taggroups[tagname] = []
 
-			if not tagname:
-				#print mod['code']
-				for modd in js_merge:
-					print mod['code']
-					if modd == mod:
-						break
+			src = taggroups[tagname]
+			src.append( mod['code'] )
+		for tagname in taggroups.keys():
+			groupsrc = '\n'.join( taggroups[tagname] )
+			js = compile_js( groupsrc, module_path, main_name=tagname )
+			tagged[ tagname ]           = js[ tagname ]
+			tagged_trans_src[ tagname ] = groupsrc
 
-				raise RuntimeError('fenced code block not given a tag-name')
-
-			js = compile_js( '\n'.join(src), module_path, main_name=tagname )
-			tagged[ tagname ] = js[ tagname ]
 			for name in js:
 				output['javascript'].append( {'name':name, 'script':js[name], 'index': index} )
+
 
 	cpyembed = []
 	nuitka = []
@@ -772,14 +972,42 @@ def build( modules, module_path, datadirs=None ):
 				if line.strip().startswith('<script ') and line.strip().endswith('</script>') and 'src="~/' in line:
 					url = line.split('src="')[-1].split('"')[0]
 					url = os.path.expanduser( url )
+
 					if os.path.isfile(url):
 						html.append('<script type="text/javascript">')
-						html.append( open(url, 'rb').read() )
+						html.append( open(url, 'rb').read().decode('utf-8') )
 						html.append('</script>')
+					elif 'git="' in line:
+						giturl = line.split('git="')[-1].split('"')[0]
+						print 'downloading library-> ' + giturl
+						cmd = ['git', 'clone', giturl]
+						subprocess.check_call(cmd, cwd=os.environ['HOME'])
+						assert os.path.isfile(url)
+						html.append('<script type="text/javascript">')
+						html.append( open(url, 'rb').read().decode('utf-8') )
+						html.append('</script>')
+					elif 'source="' in line:
+						srcurl = line.split('source="')[-1].split('"')[0]
+						print 'downloading javascript-> ' + srcurl
+						import urllib
+						srcdata = urllib.urlopen(srcurl).read()
+						srcpath = os.path.split(url)[0]
+						if not os.path.isdir(srcpath):
+							os.makedirs(srcpath)
+						open(url, 'wb').write(srcdata)
+						assert os.path.isfile(url)
+						html.append('<script type="text/javascript">')
+						html.append( open(url, 'rb').read().decode('utf-8') )
+						html.append('</script>')
+
 					else:
 						print('ERROR: could not find file to inline: %s' %url)
 						html.append( line )
 				elif line.strip().startswith('<link ') and ('href="~/' in line or "href='~/" in line):
+					zipurl = None
+					if 'zip="' in line:
+						zipurl = line.split('zip="')[-1].split('"')[0]
+
 					if 'href="' in line:
 						url = line.split('href="')[-1].split('"')[0]
 					else:
@@ -790,6 +1018,16 @@ def build( modules, module_path, datadirs=None ):
 						html.append('<style>')
 						html.append( open(url, 'rb').read() )
 						html.append('</style>')
+					elif zipurl:
+						import urllib
+						print 'downloading css library->' + zipurl
+						zipdata = urllib.urlopen(zipurl).read()
+						open('/tmp/csslib.zip', 'wb').write( zipdata )
+						subprocess.check_call(['unzip', '/tmp/csslib.zip'], cwd=os.environ['HOME'])
+						html.append('<style>')
+						html.append( open(url, 'rb').read() )
+						html.append('</style>')
+
 					else:
 						print('ERROR: could not find css file to inline: %s' %url)
 						html.append( line )
@@ -803,19 +1041,35 @@ def build( modules, module_path, datadirs=None ):
 				tag = u'<@%s>' %tagname
 				js  = tagged[tagname]
 				if tag in html:
-					#print js
-					#xxx = u'<script type="text/javascript">\n%s</script>' %js.decode('utf-8')
 					## TODO fix this ugly mess
 					try:
 						## javascript with unicode
-						xxx = u'<script type="text/javascript">\n%s</script>' %js
+						xxx = u'<script type="text/javascript" id="%s_transpiled">\n%s</script>' %(tagname, js)
 					except UnicodeDecodeError:
 						## rusthon translated to js
-						xxx = u'<script type="text/javascript">\n%s</script>' %js.decode('utf-8')
-
+						xxx = u'<script type="text/javascript" id="%s_transpiled">\n%s</script>' %(tagname, js.decode('utf-8'))
 					html = html.replace(tag, xxx)
+
+				if tagname in tagged_trans_src.keys():
+					stag = u'<!%s>' %tagname
+					py  = tagged_trans_src[tagname]
+					if stag in html:
+						## TODO fix this ugly mess
+						try:
+							xxx = u'<script type="text/rusthon" id="%s">\n%s</script>' %(tagname, py)
+						except UnicodeDecodeError:
+							xxx = u'<script type="text/rusthon" id="%s">\n%s</script>' %(tagname, py.decode('utf-8'))
+						html = html.replace(stag, xxx)
+
+
 			mod['code'] = html
 			output['html'].append( mod )
+			## inlines js app into openshift default style python server ##
+			if '--openshift-python' in sys.argv:
+				import base64
+				bcoded = base64.b64encode(mod['code'].encode('utf-8'))
+				wsgi = [ OPENSHIFT_PY[0]%bcoded, OPENSHIFT_PY[1] ]
+				output['datafiles']['wsgi.py'] = '\n'.join(wsgi).encode('utf-8')
 
 	if modules['verilog']:
 		source = []
@@ -1073,6 +1327,7 @@ def build( modules, module_path, datadirs=None ):
 		if compile_mode=='binary':
 			cmd.extend(['-O3', '-fprofile-generate', '-march=native', '-mtune=native', '-I'+tempfile.gettempdir()])
 
+		cmd.append('-Wl,-rpath,/usr/local/lib/')  ## extra user installed dynamic libs
 		cmd.append('-Wl,-rpath,./')  ## can not load dynamic libs from same directory without this
 		cmd.append(tmpfile)
 
@@ -1112,10 +1367,11 @@ def build( modules, module_path, datadirs=None ):
 			for lib in links:
 				cmd.append('-l'+lib)
 
-		if link or giws:
+		## always link to libdl, external libraries may require dl_open, etc.
+		cmd.append('-ldl')
 
-			if libdl:
-				cmd.append('-ldl')
+
+		if link or giws:
 
 			if giws:   ## link to the JVM if giws bindings were compiled ##
 				cmd.append('-ljvm')
@@ -1155,6 +1411,47 @@ def build( modules, module_path, datadirs=None ):
 		python_main['script'] = '\n'.join(python_main['script'])
 		output['python'].append( python_main )
 
+	if modules['bazel']:
+		# http://bazel.io/docs/build-ref.html#workspaces
+		## a WORKSPACE file is required, even if empty.
+		tmpdir = tempfile.gettempdir()
+		open(tmpdir+'/WORKSPACE', 'wb')
+
+		for filename in output['datafiles'].keys():
+			open(tmpdir+'/'+filename, 'wb').write(output['datafiles'][filename])
+
+		bazelbuilds = []
+		mods_sorted_by_index = sorted(modules['bazel'], key=lambda mod: mod.get('index'))
+		for mod in mods_sorted_by_index:
+			bazelconfig = mod['code']
+			open(tmpdir+'/BUILD', 'wb').write(bazelconfig)
+			for chk in bazelconfig.split(','):
+				chk = chk.strip()
+				words = chk.split()
+				if chk.endswith('"') and 'name' in words and '=' in words:
+					chk = chk.split()
+					bazelbuilds.append(chk[-1][1:-1])
+
+
+		assert len(bazelbuilds)==1
+		buildname = bazelbuilds[0]
+		#subprocess.check_call(['bazel', 'build', ':'+buildname], cwd=tmpdir)
+		subprocess.check_call(['bazel', 'run', ':'+buildname], cwd=tmpdir)
+
+	if gyp_builds:
+		tmpdir = tempfile.gettempdir()
+		for gname in gyp_builds.keys():
+			gbuild = gyp_builds[gname]
+			if gbuild['src']:
+				open(tmpdir+'/binding.gyp', 'wb').write(gbuild['gyp'])
+				open(tmpdir+'/'+gname, 'wb').write( gbuild['src'] )
+				subprocess.check_call(['nw-gyp', 'configure', '--target=0.12.3'], cwd=tmpdir)
+				subprocess.check_call(['nw-gyp', 'build'], cwd=tmpdir)
+
+				node_module = open(tmpdir+'/build/Release/binding.node', 'rb').read()
+				output['datafiles']['binding.node'] = node_module
+
+
 	return output
 
 def get_first_build_from_package(package):
@@ -1190,7 +1487,8 @@ def save_tar( package, path='build.tar' ):
 	for lang in 'rust c c++ c# go javascript json python xml html verilog java nim dart lua'.split():
 		for info in package[lang]:
 			name = 'untitled'
-			if 'name' in info: name = info['name']
+			if 'name' in info and info['name']:
+				name = info['name']
 
 			source = False
 			is_bin = False
@@ -1209,7 +1507,7 @@ def save_tar( package, path='build.tar' ):
 				is_bin = True
 			elif 'code' in info:
 				if lang=='verilog': print(info['code'])  ## just for testing.
-				s.write(info['code'])
+				s.write(info['code'].encode('utf-8'))
 			elif 'script' in info:
 				s.write(info['script'])
 			s.seek(0)
@@ -1219,8 +1517,14 @@ def save_tar( package, path='build.tar' ):
 
 			ti = tarfile.TarInfo(name=name)
 			ti.size=len(s.buf)
-			if is_bin: ti.mode = 0o777
-			tar.addfile(tarinfo=ti, fileobj=s)
+			if is_bin:
+				ti.mode = 0o777
+			try:
+				tar.addfile(tarinfo=ti, fileobj=s)
+			except UnicodeEncodeError as err:
+				s.seek(0)
+				print s.getvalue()
+				raise err
 
 			if source:
 				s = StringIO.StringIO()
@@ -1265,19 +1569,29 @@ def main():
 	if len(sys.argv)==1 or '--help' in sys.argv:
 		print('usage: ./rusthon.py [python files] [markdown files] [tar file] [--release] [--run=] [--data=]')
 		print('		[tar file] is the optional name of the output tar that contains the build')
-		print()
+		print
 		print('		source files, transpiled source, and output binaries.')
-		print()
+		print
 		print('		--release generates optimized output without extra runtime checks')
-		print()
+		print
 		print('		--run is given a list of programs to run, "--run=a.py,b.py"')
 		print('		a.py and b.py can be run this way by naming the code blocks in the markdown')
 		print('		using the tag syntax "@a.py" on the line before the code block.')
-		print()
+		print
 		print('		--data is given a list of directories to include in the build dir and tarfile.')
-		print()
+		print
+		print('		--obfuscate produces random names for unicode functions and variables.')
+		print
+		print('		--literate-unicode enables unicode variables names to be output for the javascript backend.')
+		print
+		print('		--convert2python=MYOUTPUT strips away static type annotations, to run your script in regular Python.')
+		print
 		print('		--anaconda run scripts with Anaconda Python, must be installed to ~/anaconda')
-		print()
+		print
+		print('		--transparent linux and NW.js only (forces window transparency and disables GPU acceleration)')
+		print
+		print('		--debug-inter print intermediate translation code and then exit.')
+		print
 		print('		note: when using regular python files (.py) as input instead of markdown (.md)')
 		print('		you can use these extra options to set which backend is used by the transpiler:')
 		for backend in '--c++ --javascript --go --rust'.split():
@@ -1298,6 +1612,7 @@ def main():
 	datadirs = []
 	j2r = False
 	anaconda = False
+	convert2py = False
 
 	for arg in sys.argv[1:]:
 		if os.path.isdir(arg):
@@ -1313,6 +1628,8 @@ def main():
 			output_dir = arg.split('=')[-1]
 			if output_dir.startswith('~'):
 				output_dir = os.path.expanduser(output_dir)
+		elif arg.startswith('--convert2python='):
+			convert2py = arg.split('=')[-1]
 
 		elif arg.endswith('.py'):
 			scripts.append(arg)
@@ -1360,17 +1677,37 @@ def main():
 			sys.exit()
 
 
+	if convert2py:
+		## strips away rusthon type annotations ##
+		if not len(scripts):
+			raise RuntimeError('the option --convert2python=myoutput requires an input script')
+		if len(scripts)!=1:
+			raise RuntimeError('the option --convert2python=myoutput requires a single input script')
+		a = typedpython.transform_source(
+			open(scripts[0],'rb').read(), 
+			strip=True
+		)
+		open(convert2py, 'wb').write(a)
+		sys.exit()
+
 	base_path = None
 	singleout = None
 	for path in scripts:
+		## note: .decode('utf-8') is not required here,
+		## should also check the strip to ensure the user has not
+		## used unicode strings starting with the `u` prefix,
+		## because that will break the translator, because it
+		## promotes those strings to unicode objects in the AST (which is written in Python2)
 		script = open(path,'rb').read()
 		if '--c++' in sys.argv:          script = '#backend:c++\n'+script
 		elif '--javascript' in sys.argv: script = '#backend:javascript\n'+script
 		elif '--rust' in sys.argv: script = '#backend:rust\n'+script
 		elif '--go' in sys.argv:   script = '#backend:go\n'+script
-		elif '--dart' in sys.argv: script = '#backend:dart\n'+script
-		elif '--lua' in sys.argv:  script = '#backend:lua\n'+script
+		elif '--dart' in sys.argv: raise RuntimeError('dart backend removed')
+		elif '--lua' in sys.argv:  raise RuntimeError('lua backend removed')
 		elif '--verilog' in sys.argv: script = '#backend:verilog\n'+script
+		else: script = '#backend:javascript\n'+script
+
 		fpath,fname = os.path.split(path)
 		tag = fname.split('.')[0]
 		singlemod = {'name':'main', 'tag':tag, 'code':script}
@@ -1399,7 +1736,6 @@ def main():
 		print('saved output to: %s'%output_file)
 
 	elif not save:
-		print('testing build...')
 		tmpdir = tempfile.gettempdir()
 		## copy jar and other extra libraries files files ##
 		for p in datadirs:
@@ -1418,7 +1754,15 @@ def main():
 
 		if package['html']:
 			for i,page in enumerate(package['html']):
-				tmp = tempfile.gettempdir() + '/rusthon-webpage%s.html' %i
+				tname = 'rusthon-webpage%s.html' %i
+
+				if 'name' in page and page['name']:
+					tname = page['name']
+
+				tmp = tempfile.gettempdir() + '/' + tname
+				if sys.platform=='darwin':  ## force /tmp directory on OSX, makes debugging the output simpler
+					tmp = '/tmp/' + tname
+
 				## note in Chrome UTF-8 javascript will fail with this error: 
 				## `Unexpected token ILLEGAL` with unicode variables
 				## the file must be written as UTF-16.
@@ -1426,25 +1770,30 @@ def main():
 				#open(tmp, 'wb').write( page['code'].encode('utf-8') )
 				open(tmp, 'wb').write( page['code'].encode('utf-16') )
 
-				if sys.platform=='darwin':  ## hack for OSX
+				if i<len(package['html'])-1:  ## only launch the last html file.
+					pass
+				elif sys.platform=='darwin' and not nodewebkit_runnable:  ## hack for OSX
 					subprocess.call(['open', tmp])
-				elif nodewebkit_runnable and '--release' not in sys.argv:
+				elif nodewebkit_runnable:
 					## nodewebkit looks for `package.json` in the folder it is given ##
+					nwcfg = '{"name":"test", "main":"%s", ' %os.path.split(tmp)[1]
+					if '--frameless' in sys.argv:
+						nwcfg += '"window":{"width":1200, "height":680, "toolbar":false, "frame":false}}'
+					elif '--desktop' in sys.argv:
+						## note as_desktop is broken in new NW.js
+						## https://github.com/nwjs/nw.js/issues/2833
+						nwcfg += '"window":{"width":1200, "height":680, "toolbar":false, "as_desktop":true, "frame":false}}'
+					else:
+						nwcfg += '"window":{"width":1200, "height":680, "toolbar":false}}'
 
-					open(os.path.join(tmpdir,"nwstartup.js"),'wb').write(NW_STARTUP_HACK)
-
-
-					nwcfg = '{"name":"test", "node-main":"nwstartup.js", "main":"%s", "window":{"width":800, "height":600, "toolbar":false}}' %os.path.split(tmp)[1]
 					open(os.path.join(tmpdir,"package.json"),'wb').write(nwcfg)
-
-					subprocess.Popen([nodewebkit, tmpdir], cwd=tmpdir)
-
-					## this hack will not work ##
-					#open(tmp, 'wb').write( NW_DEVTOOLS_HACK )
-					#subprocess.Popen([nodewebkit, tmpdir], cwd=tmpdir)
-					#time.sleep(2)
-					#open(tmp, 'wb').write( page['code'] )  ## rewrite html this happens after devtools window is shown.
-
+					nwcmd = [nodewebkit]
+					if '--v8-natives' in sys.argv:
+						nwcmd.append('--allow-natives-syntax')
+					if sys.platform=='linux2' and '--transparent' in sys.argv:
+						nwcmd.extend(['--enable-transparent-visuals', '--disable-gpu'])
+					nwcmd.append(tmpdir)
+					subprocess.Popen(nwcmd, cwd=tmpdir)
 				else:
 					webbrowser.open(tmp)
 
@@ -1452,12 +1801,20 @@ def main():
 			tmpdir = tempfile.gettempdir()
 			for pak in package['javascript']:
 				fname = pak['name']
-				if not fname.endswith('.js'):
+				if fname is None:
+					fname = 'rusthon-temp.js'
+				elif not fname.endswith('.js'):
 					fname += '.js'
+
 				fpath = os.path.join(tmpdir, fname)
-				#open(fpath, 'wb').write( pak['script'].decode('utf-8').encode('utf-16') )
-				open(fpath, 'wb').write( pak['script'].encode('utf-16') )  ## TODO fix nodejs unicode
-				subprocess.check_call(['node', fpath])
+				open(fpath, 'wb').write( pak['script'] )
+				#xxx = pak['script'].decode('utf-8')
+				#open(fpath, 'wb').write( xxx.encode('utf-16') )  ## TODO fix nodejs unicode
+				#codecs.open(fpath, 'w', 'utf-8').write( pak['script'] )  ## TODO fix nodejs unicode
+				if '--v8-natives' in sys.argv:
+					subprocess.check_call([nodejs_exe, '--allow-natives-syntax', fpath])
+				else:
+					subprocess.check_call([nodejs_exe, fpath])
 
 	else:
 		save_tar( package, output_tar )

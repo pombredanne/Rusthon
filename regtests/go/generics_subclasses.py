@@ -19,6 +19,7 @@ class C(A):
 		return self.x + 200
 
 
+@generic
 def my_generic( g:A ) ->int:
 	return g.method1()
 
@@ -26,12 +27,15 @@ def main():
 	a = A( 100 )
 	b = B( 100 )
 	c = C( 100 )
+	print a
+	print b
+	print c
 
 	x = my_generic( a )
-	TestError(a.x == x )
+	assert a.x == x
 
 	y = my_generic( b )
-	TestError( y==200 )
+	assert y==200
 
 	z = my_generic( c )
-	TestError( z==300 )
+	assert z==300

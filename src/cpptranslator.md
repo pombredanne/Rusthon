@@ -43,6 +43,11 @@ class CppGenerator( RustGenerator, CPythonGenerator ):
 				return True
 		return False
 
+	def visit_Assert(self, node):
+		t = self.visit(node.test)
+		return 'if (!(%s)) {throw std::runtime_error("assertion failed: %s"); }' %(t,t)
+
+
 	def visit_ImportFrom(self, node):
 		# print node.module
 		# print node.names[0].name
@@ -191,6 +196,11 @@ class CppGenerator( RustGenerator, CPythonGenerator ):
 		pak['main'] = '\n'.join( lines )
 		return pak['main']
 
+	def visit_Set(self, node):
+		## c++11 aggregate initialization
+		## http://en.cppreference.com/w/cpp/language/aggregate_initialization
+		return '{%s}' %','.join([self.visit(elt) for elt in node.elts])
+
 ```
 
 low level `new` for interfacing with external c++.
@@ -240,7 +250,7 @@ casting works fine with `static_cast` and `std::static_pointer_cast`.
 
 ```python
 
-	def __init__(self, source=None, requirejs=False, insert_runtime=False, cached_json_files=None):
+	def __init__(self, source=None, requirejs=False, insert_runtime=False, cached_json_files=None, use_try=True):
 		RustGenerator.__init__(self, source=source, requirejs=False, insert_runtime=False)
 		self._cpp = True
 		self._rust = False  ## can not be true at the same time self._cpp is true, conflicts in switch/match hack.
@@ -257,6 +267,8 @@ casting works fine with `static_cast` and `std::static_pointer_cast`.
 		self.cached_json_files = cached_json_files or dict()
 		self.usertypes = dict()
 		self._user_class_headers = dict()
+		self._finally_id = 0
+		self._use_try = use_try
 
 	def visit_Delete(self, node):
 		targets = [self.visit(t) for t in node.targets]
@@ -281,9 +293,14 @@ casting works fine with `static_cast` and `std::static_pointer_cast`.
 
 		return '\n'.join(r)
 
-	def visit_Str(self, node):
+	def visit_Str(self, node, wrap=True):
 		s = node.s.replace("\\", "\\\\").replace('\n', '\\n').replace('\r', '\\r').replace('"', '\\"')
-		if self.usertypes and 'string' in self.usertypes.keys():
+		if wrap is False:
+			return s
+		elif self._force_cstr:
+			return '"%s"' % s
+
+		elif self.usertypes and 'string' in self.usertypes.keys():
 			if self.usertypes['string'] is None:
 				return '"%s"' % s
 			else:
@@ -314,35 +331,110 @@ TODO
 ```python
 
 	def visit_TryExcept(self, node, finallybody=None):
+		## TODO: check why `catch (...)` is not catching file errors
 		out = []
 
-		out.append( 'try {' )
+		use_try = self._use_try  ## when building with external tools or platforms -fexceptions can not be enabled.
+
+
+		if use_try:
+			if finallybody:
+				self._finally_id += 1
+				out.append('bool __finally_done_%s = false;' %self._finally_id)
+				out.append( self.indent()+'try {' )
+			else:
+				out.append( 'try {' )
+
 		self.push()
 		for b in node.body:
 			out.append( self.indent()+self.visit(b) )
 
 		self.pull()
-		out.append( self.indent() + '} catch (const std::exception& e) {' )
-		self.push()
-		for h in node.handlers:
-			out.append(self.indent()+self.visit(h))
-		self.pull()
+		if use_try:
+			out.append(self.indent()+ '}' )
 
-		if finallybody:
-			## wrap in another try that is silent, always throw e
-			out.append('try {		// finally block')
-			for b in finallybody:
-				out.append(self.visit(b))
+			handler_types = []
+			for ha in node.handlers:
+				if ha.type:
+					handler_types.append(self.visit(ha.type))
 
-			out.append('} throw e;')
+			if handler_types:
+				out.append( self.indent() + 'catch (std::runtime_error* __error__) {' )
+				self.push()
+				out.append( self.indent() + 'std::string __errorname__ = __parse_error_type__(__error__);')
+			else:
+				out.append( self.indent() + 'catch (...) {' )
+				self.push()
 
-		out.append( '}' )
+			for h in node.handlers:
+				out.append(
+					self.indent() + self.visit_ExceptHandler(h, finallybody=finallybody)
+				)
+			self.pull()
 
-		out.append( self.indent() + 'catch (const std::overflow_error& e) { std::cout << "OVERFLOW ERROR" << std::endl; }' )
-		out.append( self.indent() + 'catch (const std::runtime_error& e) { std::cout << "RUNTIME ERROR" << std::endl; }' )
-		out.append( self.indent() + 'catch (...) { std::cout << "UNKNOWN ERROR" << std::endl; }' )
+			out.append(self.indent()+ '}' )
+
+			## TODO also catch these error that standard c++ libraries are likely to throw ##
+			#out.append( self.indent() + 'catch (const std::overflow_error& e) { std::cout << "OVERFLOW ERROR" << std::endl; }' )
+			#out.append( self.indent() + 'catch (const std::runtime_error& e) { std::cout << "RUNTIME ERROR" << std::endl; }' )
+			#out.append( self.indent() + 'catch (const std::exception& e) {' )
+			#out.append( self.indent() + 'catch (...) { std::cout << "UNKNOWN ERROR" << std::endl; }' )
+
+
+			## wrap in another try that is silent
+			if finallybody:
+				out.append(self.indent()+'if (__finally_done_%s == false) {' %self._finally_id )
+				self.push()
+				out.append(self.indent()+'try {		// finally block')
+				self.push()
+				for b in finallybody:
+					out.append(self.indent()+self.visit(b))
+				self.pull()
+				out.append(self.indent()+'} catch (...) {}')
+				self.pull()
+				out.append(self.indent()+'}')
+
+				self._finally_id -= 1
 
 		return '\n'.join( out )
+
+	def visit_ExceptHandler(self, node, finallybody=None):
+		#out = ['catch (std::runtime_error* __error__) {']
+		T = 'Error'
+		out = []
+		if node.type:
+			T = self.visit(node.type)
+			out.append('if (__errorname__ == std::string("%s")) {' %T )
+
+		self.push()
+
+		if node.name:
+			out.append(self.indent()+'auto %s = *__error__;' % self.visit(node.name))
+
+		## this happens before the exception body, while this is not strictly python
+		## it is close enough, because the main requirement is that the finally body
+		## is always run, even if there is a return or new exception raised.
+		if finallybody:
+			out.append(self.indent()+'__finally_done_%s = true;' %self._finally_id)
+			self.push()
+			out.append(self.indent()+'try {		// finally block')
+			self.push()
+			for b in finallybody:
+				out.append(self.indent()+self.visit(b))
+			self.pull()
+			out.append(self.indent()+'} catch (...) {}')
+			self.pull()
+
+
+		for b in node.body:
+			out.append(self.indent()+self.visit(b))
+
+		self.pull()
+		if node.type:
+			out.append(self.indent()+'}')
+		return '\n'.join(out)
+
+
 ```
 
 
@@ -484,10 +576,12 @@ TODO save GCC PGO files.
 
 ```python
 
-def translate_to_cpp(script, insert_runtime=True, cached_json_files=None):
-	#raise SyntaxError(script)
+def translate_to_cpp(script, insert_runtime=True, cached_json_files=None, use_try=True):
+	if '--debug-inter' in sys.argv:
+		raise RuntimeError(script)
 	if insert_runtime:
 		runtime = open( os.path.join(RUSTHON_LIB_ROOT, 'src/runtime/cpp_builtins.py') ).read()
+		runtime = python_to_pythonjs( runtime, cpp=True )
 		script = runtime + '\n' + script
 
 	try:
@@ -497,7 +591,12 @@ def translate_to_cpp(script, insert_runtime=True, cached_json_files=None):
 		sys.stderr.write('\n'.join(e))
 		raise err
 
-	g = CppGenerator( source=script, insert_runtime=insert_runtime, cached_json_files=cached_json_files )
+	g = CppGenerator(
+		source=script, 
+		insert_runtime=insert_runtime, 
+		cached_json_files=cached_json_files,
+		use_try = use_try
+	)
 	g.visit(tree) # first pass gathers classes
 	pass2 = g.visit(tree)
 	g.reset()

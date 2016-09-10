@@ -1,4 +1,4 @@
-inline('var __𝕦𝕚𝕕__ = 1')  ## used for object hashes, gets incremented by object constructors
+inline('var __$UID$__ = 1')  ## used for object hashes, gets incremented by object constructors
 
 inline('IndexError = function(msg) {this.message = msg || "";}; IndexError.prototype = Object.create(Error.prototype); IndexError.prototype.name = "IndexError";')
 inline('KeyError   = function(msg) {this.message = msg || "";}; KeyError.prototype = Object.create(Error.prototype); KeyError.prototype.name = "KeyError";')
@@ -8,493 +8,31 @@ inline('RuntimeError   = function(msg) {this.message = msg || "";}; RuntimeError
 inline('WebWorkerError = function(msg) {this.message = msg || "";}; WebWorkerError.prototype = Object.create(Error.prototype);WebWorkerError.prototype.name = "WebWorkerError";')
 inline('TypeError = function(msg) {this.message = msg || "";}; TypeError.prototype = Object.create(Error.prototype);TypeError.prototype.name = "TypeError";')
 
-# the unicode decorator is used in the global namespace to define
-# a mapping from the function name to the unicode version of the name.
-# the user is able to then define their own unicode scripting language,
-# that can have greater readablity, and will not having naming collisions
-# with external javascript libraries, because nobody has made js libraries
-# yet that use unicode variable names.
-@unicode('𝑫𝒊𝒄𝒕')
-def dict( d, copy=False, keytype=None, valuetype=None ):
-	## note: the chrome debugger will still show these hidden attributes
-	## when printing the object in the console, even when `enumerable` is false.
-	Object.defineProperty(d, '__class__', value=dict, enumerable=False)
+def __invalid_call__(msg, args):
+	print '[INVALID CALL ARGUMENTS]'
+	if args is not undefined:
+		for i in range(args.length):
+			print '	argument:' + i + ' -> ' + args[i]
+	raise RuntimeError(msg)
+
+def __array_fill__(arr, items):
+	for i in range(items.length):
+		arr[i] = items[i]
+	return arr
+
+def __set_timeout(func, seconds):
+	## note: 10ms is the smallest possible time for setTimeout/Interval
+	ms = seconds * 1000
+	id = setTimeout( func, ms )
+	func._timeout_id = id
+	return func
+
+def __set_interval(func, seconds):
+	ms = seconds * 1000
+	id = setInterval( func, ms )
+	func._interval_id = id
+	return func
 
-	if keytype is not None or valuetype is not None:
-
-		if keytype is not None:
-			Object.defineProperty(d, '__keytype__', value=keytype, enumerable=False)
-		if valuetype is not None:
-			Object.defineProperty(d, '__valuetype__', value=valuetype, enumerable=False)
-
-		def __setitem__(key, value):
-			if keytype is not None:
-				if not isinstance(key, keytype):
-					raise TypeError('invalid key type')
-			if valuetype is not None:
-				if not isinstance(value, valuetype):
-					raise TypeError('invalid value type')
-
-			inline('d[key] = value')
-
-		Object.defineProperty(d, '__setitem__', value=__setitem__, enumerable=False)
-
-
-	if not copy:
-		return d
-	else:
-		raise RuntimeError('TODO dict(copyme)')
-
-dict.__name__ = 'dict'
-
-@unicode('𝑷𝒓𝒊𝒏𝒕')
-def __print__():
-	for a in arguments:
-		console.log(a)
-
-def __object_keys__(ob):
-	'''
-	notes:
-		. promotes keys to integers, also works on external objects coming from js.
-		. Object.keys(ob) traverses the full prototype chain.
-	'''
-	arr = []
-	isdigits = False
-	if ob.__keytype__ is not undefined:
-		if ob.__keytype__ == 'int':
-			isdigits = True
-	else:
-		## this could be faster using maybe using this trick?
-		## (JSON.stringify(Object.keys(ob)).replace('"','').replace(',', '')[1:-1] + '').isdigit()
-		test = 0
-		inline('for (var key in ob) { arr.push(key); if (key.isdigit()) {test += 1;} }')
-		isdigits = test == arr.length
-
-	if isdigits:
-		iarr = []
-		for key in arr:
-			iarr.push( int(key) )
-		return iarr
-	else:
-		return arr
-
-## this is not called ObjectKeys because this is used for `ob.keys()`
-## where `ob` could be a regular object, or python dict.
-@unicode('𝑲𝒆𝒚𝒔')
-def __jsdict_keys(ob):
-	if ob.__class__ is not undefined:  ## assume this is a PythonJS class and user defined `keys` method
-		if ob.__class__ is dict:
-			if ob.__keytype__ is not undefined and ob.__keytype__ == 'int':
-				return JSON.parse(
-					'[' + 
-					inline("Object.keys( ob ).toString()").replace('"','')
-					+ ']'
-				)
-			else:
-				return inline("Object.keys( ob )")
-		else:
-			return inline("ob.keys()")
-	elif instanceof(ob, Object):
-		## what is a good way to know when this an external class instance with a method `keys`
-		## versus an object where `keys` is is a function?
-		## this only breaks with classes from external js libraries?
-		if ob.keys is not undefined and isinstance(ob.keys, Function):
-			return inline("ob.keys()")
-		else:
-			return inline("Object.keys( ob )")
-	else:  ## rare case ##
-		## something without a prototype - created using Object.create(null) ##
-		return inline("ob.keys()")
-
-def __jsdict_values(ob):
-	if instanceof(ob, Object):
-		arr = []
-		for key in ob:
-			if ob.hasOwnProperty(key):
-				value = ob[key]
-				arr.push( value )
-		return arr
-	else:  ## PythonJS object instance ##
-		## this works because instances from PythonJS are created using Object.create(null) ##
-		return JS("ob.values()")
-
-@bind(Function.prototype.redefine)
-def __redef_function(src):
-	if isinstance(src, Function):
-		this.__redef = src
-		this.__recompile = undefined
-	else:
-		this.__recompile = src
-#Function.prototype.redefine = __redef_function
-
-## TODO clean up below using @bind
-
-def __debugger_overlay():
-	overlay = document.getElementById('DEBUG_OVERLAY')
-	if overlay is None:
-		overlay = document.createElement('div')
-		overlay.setAttribute('id', 'DEBUG_OVERLAY')
-		document.body.appendChild(overlay)
-		overlay.style.position='absolute'
-		overlay.style.zIndex = 100
-		overlay.style.bottom = 0
-		overlay.style.right = 0
-		overlay.style.width = '100%'
-		overlay.style.height = '100%'
-		overlay.style.backgroundColor = 'black'
-		overlay.style.color = 'grey'
-
-		header = document.createElement('h2')
-		header.appendChild(document.createTextNode('header...'))
-		overlay.appendChild(header)
-
-		def _set_header(txt):
-			header.firstChild.nodeValue=txt
-
-		overlay._set_header = _set_header
-
-		closebut = document.createElement('button')
-		closebut.appendChild(document.createTextNode('close'))
-		overlay.appendChild( closebut )
-		closebut.style.position='absolute'
-		closebut.style.bottom = 4
-		closebut.style.right = 4
-		def closecb(): overlay.style.visibility='hidden'
-		closebut.onclick = closecb
-
-		mbut = document.createElement('button')
-		mbut.appendChild(document.createTextNode('-'))
-		overlay.appendChild( mbut )
-		mbut.style.position='absolute'
-		mbut.style.bottom = 4
-		mbut.style.right = 55
-		def mbutcb():
-			overlay.style.height='80%'
-			overlay.style.width='70%'
-		mbut.onclick = mbutcb
-
-
-		subheader = document.createElement('h4')
-		subheader.appendChild(document.createTextNode('subheader'))
-		overlay.appendChild(subheader)
-
-		def _set_subheader(txt):
-			subheader.firstChild.nodeValue=txt
-
-		overlay._set_subheader = _set_subheader
-
-		cbut = document.createElement('button')
-		cbut.appendChild( document.createTextNode('call') )
-		cbut.style.position = 'absolute'
-		cbut.style.right = 100
-		header.appendChild( cbut )
-
-		input = document.createElement('input')
-		input.setAttribute('type', 'text')
-		input.size = 10
-		input.style.position = 'absolute'
-		input.style.right = 10
-		header.appendChild( input )
-
-		overlay._header1_controls = {'call':cbut, 'args':input}
-
-
-		#####################################
-		ediv1 = document.createElement('div')
-		ediv1.setAttribute('id', 'EDITOR1')
-		overlay.appendChild(ediv1)
-
-		header2 = document.createElement('h2')
-		header2.appendChild(document.createTextNode('header2'))
-		overlay.appendChild(header2)
-
-		cbut = document.createElement('button')
-		cbut.appendChild( document.createTextNode('call') )
-		cbut.style.position = 'absolute'
-		cbut.style.right = 100
-		header2.appendChild( cbut )
-
-		input = document.createElement('input')
-		input.setAttribute('type', 'text')
-		input.size = 10
-		input.style.position = 'absolute'
-		input.style.right = 10
-		header2.appendChild( input )
-
-		overlay._header2_controls = {'call':cbut, 'args':input}
-
-		def _set_header2(txt):
-			header2.firstChild.nodeValue=txt
-
-		overlay._set_header2 = _set_header2
-
-
-		ediv2 = document.createElement('div')
-		ediv2.setAttribute('id', 'EDITOR2')
-		overlay.appendChild(ediv2)
-		ediv2.style.fontSize='18px'
-
-		def __redef_on_edit(e,t):
-			if t.__editfunc is not None:
-				t.__editfunc.redefine( t.getValue() )
-
-		if ace is not undefined:
-			overlay.style.opacity = 0.9
-
-			editor = ace.edit('EDITOR1')
-			editor.__function = None
-			editor.on('input', __redef_on_edit)
-			editor.setTheme("ace/theme/monokai")
-			editor.getSession().setMode("ace/mode/javascript")
-			editor.renderer.setOption('showLineNumbers', false)
-			editor.setOption("maxLines", 100)
-			editor.setOption("minLines", 2)
-
-			editor2 = ace.edit('EDITOR2')
-			editor2.__function = None
-			editor2.on('input', __redef_on_edit)
-
-			editor2.setTheme("ace/theme/monokai")
-			editor2.getSession().setMode("ace/mode/javascript")
-			editor2.renderer.setOption('showLineNumbers', false)
-			editor2.setAutoScrollEditorIntoView(true)
-			editor2.setOption("maxLines", 100)
-			editor2.setOption("minLines", 2)
-
-		else:
-			editor = document.createElement('textarea')
-			editor2 = document.createElement('textarea')
-			ediv1.appendChild(editor)
-			ediv2.appendChild(editor2)
-
-			editor.rows = 12
-			editor.cols = 70
-
-			editor2.rows = 12
-			editor2.cols = 70
-
-			editor.container = ediv1
-			editor2.container = ediv2
-
-			editor.appendChild(document.createTextNode(''))
-			editor2.appendChild(document.createTextNode(''))
-
-			def __getValue():
-				return this.firstChild.nodeValue
-			def __setValue(txt):
-				this.firstChild.nodeValue = txt
-
-			editor.getValue = __getValue
-			editor.setValue = __setValue
-			editor2.getValue = __getValue
-			editor2.setValue = __setValue
-
-			def __pass(): pass
-			__selection = {
-				'moveTo' : __pass,
-				'selectWord' : __pass,
-				'clearSelection' : __pass
-			}
-			editor.selection = __selection
-			editor2.selection = __selection
-
-	overlay.editor1 = editor
-	overlay.editor2 = editor2
-	return overlay
-
-
-def __debugger_onerror_overlay(err,f,c):
-	if err.stack is undefined:
-		## why is the stack empty from TypeError thrown from the runtime type checking?
-		inline('throw err')
-
-	if err._skip is not undefined:
-		return False
-	err._skip = True
-	debugger.log(err,f,c)
-
-	if document is undefined:  ## inside nodejs
-		return
-
-	overlay = __debugger_overlay()
-	editor = overlay.editor1
-	editor2 = overlay.editor2
-
-	errtype, errmsg = err.stack.splitlines()[0].split(':')
-	errmsg = errmsg.strip()
-	errvar = errmsg.split()[0]
-
-	search = []
-	#if errtype == 'ReferenceError':
-	search.append( errvar + '.' )  ## checks for attributes
-	search.append( errvar + '(' )  ## checks for func calls
-	search.append( errvar + '[' )  ## checks for func calls
-	#search.append(errvar)  ## the logic below needs to be smarter to fallback on this
-
-	errmsg_custom = []
-	for i,word in enumerate(errmsg.split()):
-		if i==0:
-			errmsg_custom.append('`' + word + '`')
-		else:
-			errmsg_custom.append(word)
-
-
-	src1 = debugger.getsource(f)
-	editor.__editfunc = None
-	editor.setValue(src1)
-	editor.__editfunc = f
-
-	def callfunc1():
-		f.redefine(editor.getValue())
-		args = overlay._header1_controls['args'].value.split(',')
-		try: f.apply(None, args)
-		except:
-			print 'ERROR in edited function: '+f.name
-			#debugger.onerror(__exception__, f,c)
-
-	overlay._header1_controls['call'].onclick = callfunc1
-
-	if c is not undefined:
-		overlay._set_header( errtype + ' caused in call to: `' + c.name + '`')
-
-		def callfunc2():
-			c.redefine(editor2.getValue())
-			args = overlay._header2_controls['args'].value.split(',')
-			try: c.apply(None, args)
-			except:
-				print 'ERROR in edited function: '+c.name
-				#debugger.onerror(__exception__, f,c)
-				#raise __exception__
-
-		overlay._header2_controls['call'].onclick = callfunc2
-
-		src2 = debugger.getsource(c)
-		editor2.__editfunc = None
-		editor2.setValue(src2)
-		editor2.__editfunc = c
-
-		foundit = False
-		for i,ln in enumerate(src2.splitlines()):
-			for term in search:
-				if term in ln:
-					editor2.selection.moveTo(i,ln.index(term))
-					editor2.selection.selectWord()
-					if term.endswith('('):
-						errmsg_custom.insert(0, 'the function')
-					else:
-						errmsg_custom.insert(0, 'the variable')
-					errmsg = ' '.join(errmsg_custom)
-					foundit = True
-					break
-			if foundit:
-				break
-
-		if foundit:
-			overlay._set_header2( errmsg )
-
-			for i,ln in enumerate(src1.splitlines()):
-				if c.name+'(' in ln:
-					editor.selection.moveTo(i,ln.index(c.name))
-					editor.selection.selectWord()
-					break
-		else:
-			overlay._set_header2( 'function: '+c.name )
-			editor2.selection.clearSelection()
-
-			for i,ln in enumerate(src1.splitlines()):
-				for term in search:
-					if term in ln:
-						editor.selection.moveTo(i,ln.index(term))
-						editor.selection.selectWord()
-						if term.endswith('('):
-							errmsg_custom.insert(0, 'the function')
-						else:
-							errmsg_custom.insert(0, 'the variable')
-						errmsg = ' '.join(errmsg_custom)
-						foundit = True
-						break
-				if foundit:
-					break
-
-			if foundit:
-				editor.container.style.fontSize='18px'
-				editor2.container.style.fontSize='12px'
-				overlay._set_header( errmsg )
-				overlay._set_subheader( errtype + ' caused in call to: `' + c.name + '`')
-
-		if src1.splitlines().length > 15:
-			editor.container.style.fontSize='14px'
-
-	## returns True uses injected breakpoints
-	if debugger.breakpoints:
-		return True
-	else:
-		return False
-
-
-def __debugger_clean_source(f):
-	source = []
-	for line in f.toString().splitlines():
-		if line.strip().startswith('/***/'):  ## skip injected try/catch for debugger
-			continue
-		else:
-			source.append(line)
-	return '\n'.join(source)
-
-def __debugger_log(e,f, called):
-	console.error(e.stack)
-	console.error('ABORT function->' + f.name)
-	#console.warn(f.toString())
-	print debugger.getsource( f )
-
-	badline = None
-	for line in e.stack.splitlines():
-		if line.strip().startswith('at '):
-			fname = line.split('(')[0][6:].strip()
-			console.warn('  error in function->' + fname)
-			if badline is None:
-				badline = fname
-			if fname == f.name:
-				break
-		else:
-			console.error(line)
-
-	if called is not undefined:
-		console.error('exception in function->'+called.name)
-		print debugger.getsource(called)
-
-	return True  ## if returns True then halt (breakpoint)
-
-
-debugger = {
-	'log'     : __debugger_log,
-	'onerror' : __debugger_onerror_overlay,  ## by default do not use breakpoints
-	'getsource' : __debugger_clean_source,
-	'showdevtools' : lambda : require('nw.gui').Window.get().showDevTools(),
-	'breakpoints'  : False,
-}
-
-## mini fake json library ##
-json = {
-	'loads': lambda s: JSON.parse(s),
-	'dumps': lambda o: JSON.stringify(o)
-}
-
-def hasattr(ob, attr):
-	if Object.hasOwnProperty.call(ob, attr):
-		return True
-	elif ob[attr] is not undefined:
-		return True
-	else:
-		return False
-
-@unicode('𝑳𝒊𝒔𝒕')
-def list(ob):
-	a = []
-	if ob is not undefined:
-		for e in ob:
-			a.push(e)
-	return a
 
 @unicode('𝑰𝒔𝑰𝒏𝒔𝒕𝒂𝒏𝒄𝒆')
 def isinstance( ob, klass):
@@ -527,6 +65,7 @@ def isinstance( ob, klass):
 		else:
 			return False
 
+
 	elif instanceof(ob, Array):
 		if klass is list:
 			return True
@@ -534,10 +73,13 @@ def isinstance( ob, klass):
 			return True
 		else:
 			return False
+
 	elif instanceof(ob, klass):
 		return True
-	elif hasattr(ob, '__class__'):
+
+	elif ob.__class__:  ## TODO check typeof
 		return issubclass(ob.__class__, klass)
+
 	elif typeof(ob)=='number':
 		if klass is int and ob.toString().isdigit():
 			return True
@@ -557,8 +99,12 @@ def isinstance( ob, klass):
 def issubclass(C, B):
 	if C is B:
 		return True
-	else:
+	elif C.__bases__:
 		for base in C.__bases__:
+			#if base is undefined:
+			#	print C.__bases__
+			#	#print __n0
+			#	raise RuntimeError(C.__bases__)
 			if issubclass(base, B):
 				return True
 	return False
@@ -569,12 +115,270 @@ def len(ob):
 		return ob.length
 	elif __is_typed_array(ob):
 		return ob.length
-	#elif instanceof(ob, ArrayBuffer):  ## missing in safari
-	#	return ob.byteLength
 	elif ob.__len__:
 		return ob.__len__()
-	else: #elif instanceof(ob, Object):
+	elif isNaN(ob):
+		raise RuntimeError('calling `len` with NaN in invalid')
+	elif typeof(ob)=='number':
+		raise RuntimeError('calling `len` on a number is invalid')
+	else:  ## let this fail at runtime if ob is not an object
 		return Object.keys(ob).length
+
+def __htmldoc_rightarrow__(arg):
+	if arg.startswith('#'):
+		return this.getElementById(arg[1:])
+	else:
+		return this.createElement(arg)
+
+def __htmlelement_rightarrow__():
+	if arguments.length==0:
+		while this.childNodes.length:
+			this.removeChild( this.firstChild )
+	else:
+		for item in arguments:
+			T = typeof(item)
+			if instanceof(item, HTMLElement):
+				this.appendChild( item )
+			elif instanceof(item, Text):  ## a text node create by `document.createTextNode`
+				this.appendChild( item )
+			elif T=='string':
+				this.appendChild( document.createTextNode(item) )
+			elif T=='function':
+				raise RuntimeError('HTMLElement->(lambda function) is invalid')
+			elif T=='object':
+				## could be a DOM node from another document/iframe
+				if item.nodeType:
+					if item.nodeType==Node.TEXT_NODE:
+						this.appendChild(item)
+					elif item.nodeType==Node.ELEMENT_NODE:
+						this.appendChild(item)
+					else:
+						raise RuntimeError('HTMLElement unknown node type')
+				else:
+					for key in item.keys():
+						this.setAttribute(key, item[key])
+			else:
+				raise RuntimeError('HTMLElement->(invalid type): '+ item)
+
+	return this
+
+
+# becomes function `ᐅ` note: from unicode unified can-ab
+def __right_arrow__():
+	ob = arguments[0]
+	args = []
+	for i in range(1, arguments.length):
+		args.push( arguments[i] )
+
+	if ob.__right_arrow__:
+		return ob.__right_arrow__.apply(ob, args)
+	elif ob.nodeType:
+		switch ob.nodeType:
+			case document.DOCUMENT_NODE:
+				ob.__right_arrow__ = __htmldoc_rightarrow__.bind(ob)
+			case document.ELEMENT_NODE:
+				ob.__right_arrow__ = __htmlelement_rightarrow__.bind(ob)
+		return ob.__right_arrow__.apply(ob, args)
+	else:
+		raise RuntimeError('invalid use of ->')
+
+if HTMLElement is not undefined:
+	HTMLElement.prototype.__right_arrow__  = __htmlelement_rightarrow__
+	HTMLDocument.prototype.__right_arrow__ = __htmldoc_rightarrow__
+
+
+# the unicode decorator is used in the global namespace to define
+# a mapping from the function name to the unicode version of the name.
+# the user is able to then define their own unicode scripting language,
+# that can have greater readablity, and will not having naming collisions
+# with external javascript libraries, because nobody has made js libraries
+# yet that use unicode variable names.
+@unicode('𝑫𝒊𝒄𝒕')
+def dict( d, copy=False, keytype=None, valuetype=None, iterable=None ):
+	## note: the chrome debugger will still show these hidden attributes
+	## when printing the object in the console, even when `enumerable` is false.
+	if instanceof(d, Array):
+		pairs = d
+		d = inline('{}')
+		for pair in pairs:
+			if keytype is not None:
+				if not isinstance(pair[0], keytype):
+					msg = 'INVALID KEY-TYPE: `%s` - expected type `%s`' %(typeof(pair[0]), keytype)
+					raise TypeError(msg)
+			if valuetype is not None:
+				if not isinstance(pair[1], valuetype):
+					msg = 'INVALID VALUE-TYPE: `%s` - expected type `%s`' %(typeof(pair[1]), valuetype)
+					raise TypeError(msg)
+
+			inline('d[ pair[0] ] = pair[1]')
+
+	if iterable is not None:
+		for pair in iterable:
+			if keytype is not None:
+				if not isinstance(pair[0], keytype):
+					msg = 'INVALID KEY-TYPE: `%s` - expected type `%s`' %(typeof(pair[0]), keytype)
+					raise TypeError(msg)
+
+			if valuetype is not None:
+				if not isinstance(pair[1], valuetype):
+					msg = 'INVALID VALUE-TYPE: `%s` - expected type `%s`' %(typeof(pair[1]), valuetype)
+					raise TypeError(msg)
+
+			inline('d[ pair[0] ] = pair[1]')
+
+
+
+	Object.defineProperty(d, '__class__', value=dict, enumerable=False)
+
+	if keytype is not None or valuetype is not None:
+
+		if keytype is not None:
+			Object.defineProperty(d, '__keytype__', value=keytype, enumerable=False)
+		if valuetype is not None:
+			Object.defineProperty(d, '__valuetype__', value=valuetype, enumerable=False)
+
+		def __setitem__(key, value):
+			if keytype is not None:
+				if not isinstance(key, keytype):
+					print 'TypeError-KEY:' + key
+					msg = 'INVALID KEY-TYPE: `%s` - expected type `%s`' %(typeof(key), keytype)
+					raise TypeError(msg)
+
+			if valuetype is not None:
+				if not isinstance(value, valuetype):
+					print 'TypeError-VALUE:' + value
+					msg = 'INVALID VALUE-TYPE: `%s` - expected type `%s`' %(typeof(value), valuetype)
+					raise TypeError(msg)
+
+			inline('d[key] = value')
+
+		Object.defineProperty(d, '__setitem__', value=__setitem__, enumerable=False)
+
+
+	if not copy:
+		return d
+	else:
+		raise RuntimeError('TODO dict(copyme)')
+
+dict.__name__ = 'dict'
+
+@unicode('𝑷𝒓𝒊𝒏𝒕')
+def __print__():
+	for a in arguments:
+		console.log(a)
+
+def __object_keys__(ob):
+	'''
+	notes:
+		. promotes keys to integers, also works on external objects coming from js.
+		. Object.keys(ob) traverses the full prototype chain.
+	'''
+	arr = []
+	if ob.__keytype__ is not undefined:
+		if ob.__keytype__ == 'int':
+			inline('for (var key in ob) {arr.push(int(key))}')
+		else:
+			inline('for (var key in ob) {arr.push(key)}')
+		return arr
+	else:
+		## this could be faster using maybe using this trick?
+		## (JSON.stringify(Object.keys(ob)).replace('"','').replace(',', '')[1:-1] + '').isdigit()
+		isdigits = False
+		test = 0
+		inline('for (var key in ob) { arr.push(key); if (key.isdigit()) {test += 1;} }')
+		isdigits = test == arr.length
+
+		if isdigits:
+			iarr = []
+			for key in arr:
+				iarr.push( int(key) )
+			return iarr
+		else:
+			return arr
+
+## this is not called ObjectKeys because this is used for `ob.keys()`
+## where `ob` could be a regular object, or python dict.
+@unicode('𝑲𝒆𝒚𝒔')
+def __jsdict_keys(ob):
+	if ob.__class__ is not undefined:  ## assume this is a PythonJS class and user defined `keys` method
+		if ob.__class__ is dict:
+			if ob.__keytype__ is not undefined and ob.__keytype__ == 'int':
+				return JSON.parse(
+					'[' + 
+					inline("Object.keys( ob ).toString()").replace('"','')
+					+ ']'
+				)
+			else:
+				return inline("Object.keys( ob )")
+		else:
+			return inline("ob.keys()")
+	elif instanceof(ob, Object):
+		## what is a good way to know when this an external class instance with a method `keys`
+		## versus an object where `keys` is is a function?
+		## this only breaks with classes from external js libraries?
+		if ob.keys is not undefined and isinstance(ob.keys, Function):
+			return inline("ob.keys()")
+		else:
+			return inline("Object.keys( ob )")
+	else:  ## rare case ##
+		## something without a prototype - created using Object.create(null) ##
+		return inline("ob.keys()")
+
+
+@bind(Function.prototype.redefine)
+def __redef_function(src):
+	if isinstance(src, Function):
+		this.__redef = src
+		this.__recompile = undefined
+	else:
+		this.__recompile = src
+#Function.prototype.redefine = __redef_function
+
+
+## mini fake json library ##
+json = {
+	'loads': lambda s: JSON.parse(s),
+	'dumps': lambda o: JSON.stringify(o)
+}
+
+def hasattr(ob, attr):
+	if Object.hasOwnProperty.call(ob, attr):
+		return True
+	elif ob[attr] is not undefined:
+		return True
+	else:
+		return False
+
+@unicode('𝑳𝒊𝒔𝒕')
+def list(ob):
+	a = []
+	if ob is not undefined:
+		if isinstance(ob, string):
+			for i in range(ob.length):
+				a.push(ob[i])
+		else:
+			for e in ob:
+				a.push(e)
+	return a
+
+@unicode('𝑻𝒖𝒑𝒍𝒆')
+def tuple(ob):
+	a = []
+	if ob is not undefined:
+		for e in ob:
+			a.push(e)
+	return a
+
+
+@bind(String.prototype.__add__)
+def __string_add(a):
+	return this + a
+
+@bind(String.prototype.__mul__)
+def __string_multiply(a):
+	out = ''
+	for i in range(a): out += this
+	return out
 
 @bind(String.prototype.__contains__)
 def __string_contains(a):
@@ -589,6 +393,10 @@ def __string_slice(start, stop, step):
 		if stop < 0:
 			stop = this.length + stop
 		return this.substring(start, stop)
+
+@bind(String.prototype.__getslice_lowerstep__)
+def __string_getslice_lowerstep__(start, step):
+	return this.__getslice__(start, undefined, step)
 
 String.prototype.splitlines = lambda : this.split('\n')
 
@@ -625,6 +433,23 @@ String.prototype.upper = lambda : this.toUpperCase()
 
 String.prototype.lower = lambda : this.toLowerCase()
 
+@bind(Number.prototype.__sub__)
+def __number_sub(other):
+	return this - other
+@bind(Number.prototype.__add__)
+def __number_add(other):
+	return this + other
+@bind(Number.prototype.__mul__)
+def __number_mul(other):
+	return this * other
+@bind(Number.prototype.__div__)
+def __number_div(other):
+	return this / other
+@bind(Number.prototype.__mod__)
+def __number_mod(other):
+	return this % other
+
+
 @bind(String.prototype.index)
 def __string_index(a):
 	i = this.indexOf(a)
@@ -632,11 +457,50 @@ def __string_index(a):
 		raise ValueError(a + ' - not in string')
 	return i
 
+@bind(Array.prototype.equals)  ## non standard
+def __array_equals(a):
+	return JSON.stringify(this) == JSON.stringify(a)
+
+
+@bind(Array.prototype.copy)    ## non standard in python, used by `myarr[:]`
+def __array_copy():
+	#return [].concat(this)
+	#return this.slice()
+	a = new Array(this.length)
+	for i in range(this.length):
+		a[i]=this[i]
+	return a
+
+#def iter(arr):
+#	if instanceof(arr, Array):
+#		return arr
+#	elif typeof(arr)=='string':
+#		return arr
+#	elif __is_some_array(arr):
+#		return arr
+#	else:
+#		return inline("Object.keys(arr)")
 
 @bind(Array.prototype.__contains__)
 def __array_contains(a):
 	if this.indexOf(a) == -1: return False
 	else: return True
+
+@bind(Array.prototype.__getslice_lowerstep__)
+def __array_getslice_lowerstep__(start, step):
+	start = start | 0
+	arr = []
+	if step < 0:
+		while start >= 0:
+			arr.push( this[start] )
+			start += step
+	else:
+		n = this.length
+		while start < n:
+			arr.push( this[start] )
+			start += step
+
+	return arr
 
 
 @bind(Array.prototype.__getslice__)
@@ -680,17 +544,54 @@ def __array_getslice(start, stop, step):
 
 
 @bind(Array.prototype.__setslice__)
-def __array_setslice(start, stop, step, items):
+def __array_setslice(start, stop, step, items):  ## TODO step
 	if start is undefined: start = 0
 	if stop is undefined: stop = this.length
-	arr = [start, stop-start]
-	for item in items: arr.push( item )
-	this.splice.apply(this, arr )
+	#arr = [start, stop-start]
+	#for i in range(items.length):
+	#	arr.push( items[i] )
+	#this.splice.apply(this, arr )
+
+	itemslen = items.length
+	thislen = this.length
+	remove  = stop-start
+	newlen  = itemslen+thislen-remove
+	if thislen < newlen:
+		offset = newlen-thislen
+		this.length = newlen
+		## move elements in place forward
+		i = thislen-1
+		while i >= stop:
+			this[ i+offset ] = this[i]
+			i -= 1
+		for j in range(itemslen):
+			this[j+start] = items[j]
+
+	elif thislen == newlen:
+		i = 0
+		for j in range(start, stop):
+			this[j] = items[i]
+			i += 1
+	else:
+		arr = [start, stop-start]
+		for i in range(items.length):
+			arr.push( items[i] )
+		this.splice.apply(this, arr )
 
 @bind(Array.prototype.append)
 def __array_append(item):
 	this.push( item )
+	#this.length += 1
+	#this[this.length-1]=item
 	return this
+
+@bind(Array.prototype.__mul__)
+def __array_mul(n):
+	a = []
+	for i in range(n):
+		a.extend(this)
+	return a
+
 
 @bind(Array.prototype.__add__)
 def __array_add(other):
@@ -698,31 +599,70 @@ def __array_add(other):
 	a.extend(this)
 	a.extend(other)
 	return a
+## helper extra `add` method for Arrays
+Array.prototype.add = Array.prototype.__add__
 
 @bind(Array.prototype.extend)
 def __array_extend(other):
-	for obj in other: this.push(obj)
+	#for obj in other: this.push(obj)  ## invalid because of for-in loops double reverse iter
+	for i in range(other.length):
+		this.push(other[i])
 	return this
 
+
+## nodejs 0.10.25 can not print arrays on the console if `pop` is changed?
+## bad idea to change the pop of array because JIT's will probably optimze for native.
+#@bind(Array.prototype.pop)
+#def __array_pop(index):
+#	if index is undefined:
+#		return inline('this.pop()')
+#	#elif index is 0:
+#	#	return this.shift()
+#	else:
+#		return inline('this.pop()')
+
+
 @bind(Array.prototype.remove)
-def func(item):
+def __array_remove(item):
 	index = this.indexOf( item )
 	this.splice(index, 1)
 
 @bind(Array.prototype.insert)
-def func(index, obj):
+def __array_insert(index, obj):
 	if index < 0: index = this.length + index
-	this.splice(index, 0, obj)
+	if index == 0:
+		this.unshift(obj)
+	else:
+		this.splice(index, 0, obj)
 
 Array.prototype.index = lambda obj : this.indexOf(obj)
 
 @bind(Array.prototype.count)
-def func(obj):
+def __array_count(obj):
 	a = 0
 	for item in this:
 		if item is obj:  ## note that `==` will not work here, `===` is required for objects
 			a += 1
 	return a
+
+
+## note Arrays in javascript by default sort by string order, even if the elements are numbers.
+def __sort_method(ob):
+	if instanceof(ob, Array):
+		if ob.length and typeof(ob[0])=='number':
+			def f(a,b):
+				if a < b:
+					return -1
+				elif a > b:
+					return 1
+				else:
+					return 0
+			inline("ob.sort( f )")
+		else:
+			inline("ob.sort()")
+	else:
+		return inline("ob.sort()")
+
 
 @unicode('𝑪𝒐𝒏𝒕𝒂𝒊𝒏𝒔')
 def __contains__( ob, a ):
@@ -765,6 +705,8 @@ def __is_some_array( ob ):
 		for t in __dom_array_types__:
 			if instanceof(ob, t):
 				return True
+	if ob.length is not undefined and typeof(ob.length)=='number':
+		return True
 	return False
 
 @unicode('𝑰𝒔𝑻𝒚𝒑𝒆𝒅𝑨𝒓𝒓𝒂𝒚')
@@ -814,83 +756,127 @@ def __sprintf(fmt, args):
 
 
 
-def __jsdict( items ):	## DEPRECATED
-	d = inline("{}")
-	for item in items:
-		key = item[0]
-		if instanceof(key, Array):
-			key = JSON.stringify(key)
-		elif key.__uid__:
-			key = key.__uid__
-		d[ key ] = item[1]
-	return d
 
 def __jsdict_get(ob, key, default_value):
-	if instanceof(ob, Object):
-		if instanceof(key, Array):
-			key = JSON.stringify(key)
-		if inline("key in ob"): return ob[key]
-		return default_value
-	else:  ## PythonJS object instance ##
-		## this works because instances from PythonJS are created using Object.create(null) ##
-		if default_value is not undefined:
-			return JS("ob.get(key, default_value)")
+	if ob.__class__ == dict:
+		v = inline('ob[key]')
+		if default_value is undefined and v is undefined:
+			print 'KeyError: key not found in object:'
+			print ob
+			raise KeyError('invalid key:' + key)
+		elif v is not undefined:
+			return v
 		else:
-			return JS("ob.get(key)")
+			return default_value
+
+	elif typeof(ob.get)=='function':
+		return inline('ob.get(key,default_value)')
+
+	else:  ## object from an external js library.
+		v = inline('ob.get(key,default_value)')
+		if default_value is undefined and v is undefined:
+			print 'KeyError: key not found in object:'
+			print ob
+			raise KeyError('invalid key:' + key)
+		elif v is not undefined:
+			return v
+		else:
+			return default_value
+
 
 def __jsdict_set(ob, key, value):
-	if instanceof(ob, Object):
-		if instanceof(key, Array):
-			key = JSON.stringify(key)
-		ob[ key ] = value
-	else:  ## PythonJS object instance ##
-		## this works because instances from PythonJS are created using Object.create(null) ##
-		JS("ob.set(key,value)")
+	if ob.__class__ == dict:
+		inline('ob[key]=value')
+	elif typeof(ob.set)=='function':
+		return inline('ob.set(key,value)')
+	else:
+		print '[method error] missing `set`'
+		print ob
+		raise RuntimeError('object has no method named `set`')
 
 
 
+@unicode('𝑫𝒊𝒄𝒕_items')
 def __jsdict_items(ob):
-	## `ob.items is None` is for: "self.__dict__.items()" because self.__dict__ is not actually a dict
-	if instanceof(ob, Object) or ob.items is undefined:  ## in javascript-mode missing attributes do not raise AttributeError
-		arr = []
-		for key in ob:
-			if Object.hasOwnProperty.call(ob, key):
-				value = ob[key]
-				arr.push( [key,value] )
-		return arr
-	else:  ## PythonJS object instance ##
-		return JS("ob.items()")
+	if ob.__class__ == dict:
+		items = []
+		for key in ob.keys():
+			items.push( [key,ob[key]] )
+		return items
+	elif typeof(ob.items)=='function':
+		return inline('ob.items()')
+	else:
+		print '[method error] missing `items`'
+		print ob
+		raise RuntimeError('object has no method named `items`')
 
-def __jsdict_pop(ob, key, _default=None):
+@unicode('𝑫𝒊𝒄𝒕_values')
+def __jsdict_values(ob):
+	if ob.__class__ == dict:
+		items = []
+		for key in ob.keys():
+			items.push( ob[key] )
+		return items
+	elif typeof(ob.values)=='function':
+		return inline('ob.values()')
+	else:
+		print '[method error] missing `values`'
+		print ob
+		raise RuntimeError('object has no method named `values`')
+
+
+@unicode('𝑫𝒊𝒄𝒕_pop')
+def __jsdict_pop(ob, key, __default__):
 	if instanceof(ob, Array):
 		if ob.length:
 			## note: javascript array.pop only pops the end of an array
+			## Array.splice changes the array inplace.
 			if key is undefined:
-				return inline("ob.pop()")
+				#return inline("ob.pop()")
+				raise RuntimeError('Array.pop(undefined)')
 			else:
-				return ob.splice( key, 1 )[0]
+				popped = ob.splice( key, 1 )
+				if popped.length == 0:
+					if __default__ is not undefined:  ## extra syntax: list.pop(item, default)
+						return __default__
+					else:
+						raise IndexError(key)
+				else:
+					return popped[0]
 		else:
 			raise IndexError(key)
-
-	elif instanceof(ob, Object):
-		if JS("key in ob"):
-			v = ob[key]
-			JS("delete ob[key]")
-			return v
-		elif _default is undefined:
-			raise KeyError(key)
+	elif ob.__class__ == dict:
+		p = ob[key]
+		if p is undefined:
+			if __default__ is not undefined:
+				return __default__
+			else:
+				raise KeyError(key)
 		else:
-			return _default
-	else:  ## PythonJS object instance ##
-		## this works because instances from PythonJS are created using Object.create(null) ##
-		return JS("ob.pop(key, _default)")
+			inline('delete ob[key]')
+			return p
+
+	elif typeof(ob.pop)=='function':
+		return inline('ob.pop(key,__default__)')
+	else:
+		print '[method error] missing `pop`'
+		print ob
+		raise RuntimeError('object has no method named `items`')
+
 
 def __jsdict_update(ob, other):
-	if typeof(ob['update'])=='function':
+	if ob.__class__ == dict:
+		keys = []  ## extra syntax: `for newkey in mydict.update(otherdict):`
+		for key in other.keys():
+			ob[key] = other[key]
+			keys.push(key)
+		return keys
+	elif typeof(ob.update)=='function':
 		return inline('ob.update(other)')
 	else:
-		for key in __object_keys__(other):
-			ob[key]=other[key]
+		print '[method error] missing `update`'
+		print ob
+		raise RuntimeError('object has no method named `update`')
 
 @unicode('𝑺𝒆𝒕')
 def set(a):
@@ -976,7 +962,9 @@ def float(a):
 	return b
 
 
-def round(a, places=0):
+def round(a, places):
+	if places is undefined:
+		places = 0
 	b = '' + a
 	if b.indexOf('.') == -1:
 		return a
@@ -1009,19 +997,21 @@ String.prototype.find = lambda a : this.indexOf(a)
 
 @bind(String.prototype.isdigit)
 def __string_isdigit():
-	digits = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
-	for char in this:
-		if char in digits: pass
-		else: return False
-	return True
+	if isNaN(this):
+		return False
+	elif this.indexOf('.')==-1:
+		return True
+	else:
+		return False
 
 @bind(String.prototype.isnumber)
 def __string_isnumber():
-	digits = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.']
-	for char in this:
-		if char in digits: pass
-		else: return False
-	return True
+	return not isNaN(this)
+
+#@bind(String.prototype.reverse)
+#def __string_invalid_method():
+#	pass
+
 
 def __replace_method(ob, a, b):
 	## this is required because string.replace in javascript only replaces the first occurrence
@@ -1135,294 +1125,10 @@ def abs( num ):
 
 @unicode('𝑶𝒓𝒅𝒊𝒏𝒂𝒍')
 def ord( char ):
-	char.charCodeAt(0)
+	return char.charCodeAt(0)
 
 @unicode('𝑪𝒉𝒂𝒓𝒂𝒄𝒕𝒆𝒓')
 def chr( num ):
 	return String.fromCharCode(num)
 
 
-class __WorkerPool__:
-	def create_webworker(self, cpuid):
-		## this is lazy because if the blob is created when the js is first executed,
-		## then it will pick all functions of `window` but they will be `undefined`
-		## if their definition comes after the construction of this singleton.
-		print 'creating blob'
-
-		## having the worker report back the current time to the main thread allows
-		## some gauge of its CPU load, this can be average over time, and the user
-		## could call something like `worker.how_busy()` which is some relative value.
-
-		header = [
-			'setInterval(',
-			'	function(){',
-			'		self.postMessage({time_update:(new Date()).getTime()});',
-			'	}, 100',
-			');',
-			## TODO other builtins prototype hacks. see above.
-			'Array.prototype.append = function(a) {this.push(a);};',
-		]
-
-		## this is something extra stuff injected from NW.js
-		## that should not be inserted into the webworker.
-		nwjs_skip = ('Buffer', 'AppView', 'WebView')
-		for name in dir(window):
-			if name in nwjs_skip:
-				continue
-			ob = window[name]
-			if ob is undefined:
-				print 'WARNING: object in toplevel namespace window is undefined ->' + name
-			elif typeof(ob) == 'function':
-				## should actually check function code for `[ native code ]` and skip those.
-
-				header.append( 'var ' + name + '=' + ob.toString() + ';\n' )
-				for subname in dir(ob.prototype):
-					sob = ob.prototype[subname]
-					header.append(name + '.prototype.' +subname + '=' + sob.toString() + ';\n' )
-			#elif typeof(ob) == 'object':
-			#	header.append( 'var ' + name + '=' + ob.toString() + ';\n' )
-
-		xlibs = []
-		for name in self.extras:
-			if '.' in name:
-				print 'import webworker submodule: ' + name
-				mod = name.split('.')[0]
-				xname = name.split('.')[1]
-				ob = eval(name)
-				if typeof(ob) == 'object':  ## copy objects with static methods
-					print 'import object: ' + xname
-					header.append( name + '= {' )
-					for sname in Object.keys(ob):
-						subob = ob[sname]
-						ok = True
-						try:
-							tmp = eval("("+subob+")")
-						except:
-							ok = False
-						if ok:
-							print 'import->: ' + sname
-							header.append( '"'+sname + '":(' + ob[sname] +')' )
-							header.append(',\n')
-					header.pop()
-					header.append('};\n')
-
-				#if mod not in xlibs:
-				#	print 'new module: '+mod
-				#	header.append('var ' + mod + '= {};' )
-				#	xlibs.append(mod)
-			else:
-				print 'import webworker module: ' + name
-				header.append( 'var ' + name + '= {};\n' )
-				modulemain = window[name]
-
-				for xname in dir(modulemain):
-					ob = modulemain[xname]
-					if typeof(ob) == 'function':
-						print 'import class: ' + xname
-						header.append( name + '.' + xname + '=' + ob.toString() + ';\n' )
-						if ob.prototype: ## copy methods
-							#for method_name in dir(ob.prototype):
-							for method_name in Object.keys(ob.prototype):
-								if method_name == 'constructor': continue
-								ok = True
-								try:
-									## getting some properties can throw deprecation errors
-									sub = ob.prototype[method_name]
-								except:
-									ok = False
-
-								if ok and typeof(sub) == 'function':
-									print 'import method: ' + method_name
-									header.append(name + '.' + xname + '.prototype.' + method_name + '=' + sub.toString() + ';' )
-									#header.append(name + '.' + xname + '.' + method_name + '=' + ob.toString() + ';' )
-
-		## Web Worker ##
-		header.extend( self.source )
-		blob = new(Blob(header, type='application/javascript'))
-		url = URL.createObjectURL(blob)
-		ww = new(Worker(url))
-		#self.thread = ww  ## temp, TODO multiple threads
-		#self.thread.onmessage = self.update.bind(this)
-
-		ww._cpuid = cpuid
-		ww._last_time_update = 0
-		ww._stream_callbacks = {}
-		ww._stream_triggers  = {}
-		ww._get_callback  = None  ## this should actually be a stack of callbacks, right now it assumes its synced
-		ww._call_callback = None  ## this should actually be a stack of callbacks.
-		ww._callmeth_callback = None  ## TODO also should be a stack
-
-		## if worker has not sent a time update in awhile ##
-		ww.busy     = lambda : ww._last_time_update - (new(Date())).getTime() < 200
-		ww.how_busy = lambda : 100.0 / (ww._last_time_update - (new(Date())).getTime())
-
-		@bind(ww.spawn_class)
-		def _spawn_class(cfg):
-			sid = cfg['spawn']
-			print '_spawn_class:' + ww._cpuid + '|' + sid
-			ww._stream_callbacks[sid] = []
-			ww._stream_triggers[sid]  = []
-			ww.postMessage(cfg)
-
-
-		def onmessage_update(evt):
-			if evt.data.time_update:  ## the worker uses setInterval to report the time, see `worker.busy()`
-				ww._last_time_update = evt.data.time_update
-			elif evt.data.debug:
-				console.warn( ww._cpuid + '|' + evt.data.debug)
-			else:
-				ww._last_time_update = (new(Date())).getTime()
-
-				msg = evt.data.message
-				## restore object class if `proto` was given (user static return type)
-				if evt.data.proto: msg.__proto__ = eval(evt.data.proto + '.prototype')
-
-
-				if evt.data.GET:
-					ww._get_callback( msg )
-				elif evt.data.CALL:
-					ww._call_callback( msg )
-				elif evt.data.CALLMETH:
-					ww._callmeth_callback( msg )
-				else:
-					id = evt.data.id
-					if id in ww._stream_callbacks:  ## channels
-						callbacks = ww._stream_callbacks[id]
-						if len(callbacks):
-							cb = callbacks.pop()
-							cb( msg )
-						else:
-							ww._stream_triggers[id].push( msg )
-					else:
-						raise WebWorkerError('invalid id:' + id)
-
-
-		ww.onmessage = onmessage_update
-		return ww
-
-	def __init__(self, src, extras):
-		## note:  src is an array
-		## note: thread-ids = `cpu-id:spawned-id`
-		self.source = src
-		self.extras = extras
-		## each worker in this pool runs on its own CPU core
-		## how to get number of CPU cores in JS?
-		self.pool = {}
-		self.num_spawned = 1  ## TODO check why this fails when zero
-
-
-	def spawn(self, cfg, options):
-		cpu = 0
-		autoscale = True
-		if options is not undefined:
-			print 'using CPU:'+options.cpu
-			cpu = options.cpu
-			autoscale = False
-
-		id = str(cpu) + '|' + str(self.num_spawned)
-		cfg['spawn']     = self.num_spawned
-		self.num_spawned += 1
-
-		if cpu in self.pool:
-			## this thread could be busy, spawn into it anyways.
-			print 'reusing cpu already in pool'
-			self.pool[cpu].spawn_class(cfg)
-			return id
-		elif autoscale:
-			print 'spawn auto scale up'
-			## first check if any of the other threads are not busy
-			readythread = None
-			cpu = len(self.pool.keys())
-			for cid in self.pool.keys():
-				thread = self.pool[ cid ]
-				if not thread.busy():
-					print 'reusing thread is not busy:' + cid
-					readythread = thread
-					cpu = cid
-					break
-
-			id = str(cpu) + '|' + str(self.num_spawned)
-
-			if not readythread:
-				assert cpu not in self.pool.keys()
-				readythread = self.create_webworker(cpu)
-				self.pool[cpu] = readythread
-
-			readythread.spawn_class(cfg)
-			return id
-		else:
-			## user defined CPU ##
-			print 'spawn user defined cpu:' + cpu
-			assert cpu not in self.pool.keys()
-			readythread = self.create_webworker(cpu)
-			self.pool[cpu] = readythread
-			self.pool[cpu].spawn_class(cfg)
-			return id
-
-	def send(self, id=None, message=None):
-		tid, sid = id.split('|')
-		if tid not in self.pool:
-			raise RuntimeError('send: invalid cpu id')
-
-		try:
-			self.pool[tid].postMessage({'send':sid, 'message':message})
-
-		except:
-			print 'DataCloneError: can not send data to webworker'
-			print message
-			raise RuntimeError('DataCloneError: can not send data to webworker')
-
-	def recv(self, id, callback):
-
-		if id is undefined:
-			raise WebWorkerError("undefined id")
-
-		tid, sid = id.split('|')
-		if tid not in self.pool:
-			raise RuntimeError('send: invalid cpu id')
-
-		ww = self.pool[ tid ]
-		if sid in ww._stream_triggers and ww._stream_triggers[sid].length:
-			callback( ww._stream_triggers[sid].pop() )
-		elif sid in ww._stream_callbacks:
-			ww._stream_callbacks[sid].insert(0, callback)
-		else:
-			raise WebWorkerError('webworker.recv - invaid id: '+id)
-
-
-	def get(self, id, attr, callback):
-		tid, sid = id.split('|')
-		if tid not in self.pool:
-			raise RuntimeError('get: invalid cpu id')
-		ww = self.pool[ tid ]
-		ww._get_callback = callback
-		ww.postMessage(
-			id  = sid,
-			get = attr
-		)
-
-	def call(self, func, args, callback):
-		#self._call = callback
-		#self.thread.postMessage({'call':func, 'args':args})
-		## which CPU do we select? default to `0`, have extra option for CPU?
-		raise RuntimeError('TODO call plain function in webworker')
-
-	def callmeth(self, id, func, args, callback):
-		tid, sid = id.split('|')
-		if tid not in self.pool:
-			raise RuntimeError('callmeth: invalid cpu id')
-		ww = self.pool[ tid ]
-		ww._callmeth_callback = callback
-		ww.postMessage(
-			id       = sid,
-			callmeth = func,
-			args     = args
-		)
-
-	def select(self, id):
-		tid, sid = id.split('|')
-		if tid not in self.pool:
-			raise RuntimeError('select: invalid cpu id')
-		if sid not in self.pool[ tid ]._stream_triggers:
-			raise RuntimeError('select: invalid worker id')
-		return self.pool[ tid ]._stream_triggers[ sid ]

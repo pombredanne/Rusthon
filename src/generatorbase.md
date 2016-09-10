@@ -131,18 +131,11 @@ do extra things like inline extra helper code for things like `hasattr`, etc.
 			assert len(node.args)==1 and isinstance(node.args[0], ast.Str)
 			return self._inline_code_helper( node.args[0].s )
 
-		elif name == 'dart_import':
-			if len(node.args) == 1:
-				return 'import "%s";' %node.args[0].s
-			elif len(node.args) == 2:
-				return 'import "%s" as %s;' %(node.args[0].s, node.args[1].s)
-			else:
-				raise SyntaxError
-
 		elif name == 'list':
 			return self._visit_call_helper_list( node )
 
 		elif name == '__get__' and len(node.args)==2 and isinstance(node.args[1], ast.Str) and node.args[1].s=='__call__':
+			raise SyntaxError('deprecated')
 			return self._visit_call_helper_get_call_special( node )
 
 		elif name.split('.')[-1] == '__go__receive__':
@@ -158,8 +151,11 @@ do extra things like inline extra helper code for things like `hasattr`, etc.
 Import `import x` and `from x import y`
 --------------------------------------
 
-
 ```python
+
+	def _importfrom_helper(self, node):
+		return ''
+
 	def visit_ImportFrom(self, node):
 		# print node.module
 		# print node.names[0].name
@@ -170,10 +166,8 @@ Import `import x` and `from x import y`
 				crate.add( alias.name )
 		if node.module=='runtime':
 			self._insert_runtime = True
-		elif node.module=='nodejs':
-			self._insert_nodejs_runtime = True
-		elif node.module=='nodejs.tornado':
-			self._insert_nodejs_tornado = True
+		else:
+			return self._importfrom_helper(node)
 
 		return ''
 
@@ -182,13 +176,9 @@ Import `import x` and `from x import y`
 		res = []
 		if r:
 			for name in r:
-				if self._go:
-					self._imports.add('import("%s");' %name)
-				elif self._rust:
+				if self._rust:  ## TODO move this to rusttranslator.md
 					if name not in self._crates:
 						self._crates[name] = set()
-				elif self._lua:
-					res.append('require "%s"' %name)
 				else:
 					raise SyntaxError('import not yet support for this backend')
 
@@ -208,7 +198,9 @@ or something that needs to be wrapped by a pointer/shared-reference.
 ```python
 
 	def is_prim_type(self, T):
-		prims = 'void bool int float double long string str char byte i32 i64 f32 f64 std::string cstring'.split()
+		prims = 'void bool int float double long string str char byte u32 u64 i32 i64 f32 f64 std::string cstring'.split()
+		if self._go:
+			prims.append( 'interface{}' )
 		if T in prims:
 			return True
 		else:
@@ -253,9 +245,14 @@ Function Decorators
 		elif isinstance(decor, ast.Call) and isinstance(decor.func, ast.Name) and decor.func.id == '__typedef__':
 			if len(decor.args) == 3:
 				vname = self.visit(decor.args[0])
-				vtype = self.visit(decor.args[1])
+				if isinstance(decor.args[1], ast.Str):
+					vtype = decor.args[1].s
+				else:
+					vtype = self.visit(decor.args[1])
 				vptr = decor.args[2].s
-				args_typedefs[ vname ] = '%s %s' %(vptr, vtype)  ## space is required because it could have the `mut` keyword
+
+				## note: the space is required because it could be `mut` rust-keyword, or `struct` C type.
+				args_typedefs[ vname ] = '%s %s' %(vptr, vtype)
 
 			else:
 				for key in decor.keywords:
@@ -284,8 +281,13 @@ Function Decorators
 							dims = arrays[ key.arg ].count('[')
 							arrtype = arrays[ key.arg ].split(']')[-1]
 
+							if self._rust:
+								if not self.is_prim_type(arrtype):
+									arrtype = 'Rc<RefCell<%s>>' %arrtype
+								
+								args_typedefs[ key.arg ] = 'Rc<RefCell<Vec<%s>>>' %arrtype
 
-							if self._cpp:
+							elif self._cpp:
 								## non primitive types (objects and arrays) can be None, `[]MyClass( None, None)`
 								## use a pointer or smart pointer. 
 								if not self.is_prim_type(arrtype):
@@ -686,23 +688,43 @@ Also implements extra syntax like `switch` and `select`.
 				raise SyntaxError( 'invalid use of with: %s' %node.context_expr)
 
 		elif isinstance(node.context_expr, ast.Str):
-			body = []
-			for b in node.body: body.append(self.visit(b))
-			return node.context_expr.s + ';'.join(body)
+			if self._cpp:
+				body = ['namespace %s {' %node.context_expr.s]
+				self.push()
+				for b in node.body:
+					body.append(self.visit(b))
+				self.pull()
+				body.append('}')
+				return  '\n'.join(body)
+
+			else:
+				raise RuntimeError('TODO namespace for some backend')
 
 		elif isinstance(node.context_expr, ast.Name) and node.optional_vars:
 			assert isinstance(node.optional_vars, ast.Subscript)
 			assert isinstance(node.optional_vars.slice, ast.Index)
 			assert node.optional_vars.slice.value.id == 'MACRO'
 			assert isinstance(node.optional_vars.value, ast.Str)
-			s = node.optional_vars.value.s.replace('.__doublecolon__.', '::')  ## TODO fix
-			s = s.replace('.__right_arrow__.', '->')   ## TODO fix
-			self.macros[ node.context_expr.id ] = s  ## set macro
+			if self._cpp:
+				macro_string = self.visit_Str(node.optional_vars.value, wrap=False)
+			else:
+				macro_string = self.visit(node.optional_vars.value)[1:-1]
+
+			macro_string = macro_string.replace('\\"', '"')
+
+			if macro_string.startswith('"'):
+				raise SyntaxError('bad macro: ' + macro_string)
+
+			macro_name   = self.visit(node.context_expr)
+			self.macros[ macro_name ] = macro_string  ## set macro
 			r = []
 			for b in node.body:
 				a = self.visit(b)
-				if a: r.append(self.indent()+a)
-			self.macros.pop(node.context_expr.id)  ## remove macro
+				if a:
+					if len(r): r.append(self.indent()+a)
+					else: r.append(a)
+
+			self.macros.pop( macro_name )  ## remove macro
 			return '\n'.join(r)
 
 		elif isinstance(node.context_expr, ast.Name):
@@ -754,7 +776,7 @@ Also implements extra syntax like `switch` and `select`.
 			if a: r.append(self.indent()+a)
 
 		if is_case and not self._rust:  ## always break after each case - do not fallthru to default: block
-			if select_hack:
+			if select_hack or self._go:
 				r.append(self.indent()+' break;}')
 			else:
 				r.append(self.indent()+'} break;')  ## } extra scope
@@ -805,10 +827,7 @@ TODO clean up.
 				closure_wrapper = '[&]{%s;}'%self.visit(node.args[0])
 				return 'std::thread %s( %s );' %(thread, closure_wrapper)
 			elif self._rust:
-				#return 'spawn( move || {%s;} );' % self.visit(node.args[0])
-				return 'Thread::spawn( move || {%s;} );' % self.visit(node.args[0])
-			elif self._dart:
-				return 'Isolate.spawn(%s);' %self.visit(node.args[0])
+				return 'thread::spawn( move || {%s;} );' % self.visit(node.args[0])
 			elif self._go:
 				return 'go %s' %self.visit(node.args[0])
 			else:  ## javascript
@@ -824,9 +843,9 @@ TODO clean up.
 					if not node.keywords[0].arg=='cpu':
 						raise SyntaxError('invalid keyword argument to the builtin `spawn`')
 					cpuid = self.visit(node.keywords[0].value)
-					return '𝑾𝒐𝒓𝒌𝒆𝒓𝑷𝒐𝒐𝒍.spawn({%s:"%s", args:[%s]}, {cpu:%s})' %(mode,fname, ','.join(args), cpuid)
+					return 'ⲢⲑⲑⲒ.spawn({%s:"%s", args:[%s]}, {cpu:%s})' %(mode,fname, ','.join(args), cpuid)
 				else:
-					return '𝑾𝒐𝒓𝒌𝒆𝒓𝑷𝒐𝒐𝒍.spawn({%s:"%s", args:[%s]})' %(mode,fname, ','.join(args))
+					return 'ⲢⲑⲑⲒ.spawn({%s:"%s", args:[%s]})' %(mode,fname, ','.join(args))
 
 		elif name == '__go_make__':
 			if len(node.args)==2:

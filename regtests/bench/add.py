@@ -2,6 +2,7 @@
 loop and add (integer)
 '''
 from time import clock
+#note: the rusthon runtime is not required here
 
 class A:
 	def __init__(self, x:int,y:int,z:int):
@@ -39,7 +40,7 @@ class M:
 def main():
 	m = M()
 	xsteps = 1000
-	ysteps = 100
+	ysteps = 500
 	start = clock()
 	n = -1000000
 	a = A(n,n+1,n)
@@ -47,3 +48,6 @@ def main():
 	c = A(n,n+3,n)
 	w = m.f1(xsteps, ysteps, a,b,c)
 	print(clock()-start)
+	print(w)  ## go will not allow unused variables
+
+main()

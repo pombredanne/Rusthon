@@ -1,10 +1,18 @@
 """sprintf"""
+from runtime import *
 
 def main():
 	a = '%s.%s' %('X', 'Y')
-	TestError(a[0] == 'X')
-	TestError(a[1] == '.')
-	TestError(a[2] == 'Y')
+	print a
+	assert(a[0] == 'X')
+	assert(a[1] == '.')
+	assert(a[2] == 'Y')
 
 	b = 'X%sX' %1.1
-	TestError(b == 'X1.1X' or b == 'X1.100000X')
+	print b
+	assert(b == 'X1.1X')
+
+	c = 'foo%s %s' %(1*1, 2+2)
+	print c
+
+main()

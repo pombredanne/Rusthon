@@ -19,9 +19,13 @@ TODO_FIX = (
 	'hello_coffee.md',
 	'hello_elm.md',
 	'hello_fullstack.md',
+	'hello_openlayers.md',
+	'hello_sdl.md',
+	'hello_civetweb.md',
+	'hello_nw_gyp.md',
 )
 
-files = os.listdir('./examples')
+files = os.listdir('../examples')
 files.reverse()
 for md in files:
 	if md in TODO_FIX:
@@ -37,8 +41,8 @@ for md in files:
 		continue
 	subprocess.check_call([
 		'python',
-		'./rusthon.py',
-		os.path.join('./examples', md)
+		'../rusthon.py',
+		os.path.join('../examples', md)
 	])
 	passed.append( md )
 
